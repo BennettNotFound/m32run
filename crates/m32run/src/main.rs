@@ -9,49 +9,67 @@
 use std::env;
 use std::process;
 
-use loader::load;
-use x86core::ExecError;
-use shim::handle_syscall; // 引入 shim 层的系统调用处理函数
+use loader::{load, DyldError};
+use shim::handle_syscall;
+use x86core::ExecError; // 引入 shim 层的系统调用处理函数
 
 fn main() {
-    // 1. 获取原始参数并转为迭代器，跳过第一个（程序路径）
-    let mut args_iter = env::args().skip(1).peekable();
-
-    // 2. 检查是否有 --trace 参数
+    // 1. 先解析工具参数
+    let mut args: Vec<String> = env::args().skip(1).collect();
     let mut trace_enabled = false;
-    if let Some(arg) = args_iter.peek() {
-        if arg == "--trace" {
-            trace_enabled = true;
-            args_iter.next(); // 真正消耗掉这个参数
+    let mut max_total_instructions: Option<u64> = None;
+    let mut first_non_flag = 0usize;
+    while first_non_flag < args.len() {
+        match args[first_non_flag].as_str() {
+            "--trace" => {
+                trace_enabled = true;
+                first_non_flag += 1;
+            }
+            "--max-instructions" => {
+                if first_non_flag + 1 >= args.len() {
+                    eprintln!("Usage: m32run [--trace] [--max-instructions N] <macho32-file> [args...]");
+                    process::exit(1);
+                }
+                let raw = &args[first_non_flag + 1];
+                let parsed = raw.parse::<u64>().unwrap_or(0);
+                if parsed == 0 {
+                    eprintln!("Invalid --max-instructions value: {}", raw);
+                    process::exit(1);
+                }
+                max_total_instructions = Some(parsed);
+                first_non_flag += 2;
+            }
+            _ => break,
         }
     }
 
-    // 3. 获取 Mach-O 文件路径
-    let prog_path = match args_iter.next() {
-        Some(path) => path,
-        None => {
-            eprintln!("Usage: m32run [--trace] <macho32-file> [args...]");
-            process::exit(1);
-        }
-    };
+    if first_non_flag >= args.len() {
+        eprintln!("Usage: m32run [--trace] [--max-instructions N] <macho32-file> [args...]");
+        process::exit(1);
+    }
+    let prog_path = args[first_non_flag].clone();
+    let prog_args = args.split_off(first_non_flag + 1);
 
-    // 4. 剩下的全部作为程序参数
-    let prog_args: Vec<String> = args_iter.collect();
-
-    // 5. 加载并运行
+    // 2. 加载并运行
     match load(&prog_path, &prog_args, trace_enabled) {
         Ok(mut loaded) => {
             loaded.cpu.trace = trace_enabled; // 设置追踪开关
 
-            let max_instructions = 100000;
-            let mut total_instructions = 0;
+            let step_instructions = 100_000;
+            let mut total_instructions: u64 = 0;
 
             loop {
-                match loaded.cpu.run(&mut loaded.mem, max_instructions) {
+                match loaded.cpu.run(&mut loaded.mem, step_instructions) {
                     Ok(()) => {
-                        total_instructions += max_instructions;
-                        println!("Execution reached limit of {} instructions", total_instructions);
-                        break;
+                        total_instructions = total_instructions.saturating_add(step_instructions as u64);
+                        if let Some(limit) = max_total_instructions {
+                            if total_instructions >= limit {
+                                println!("Execution reached configured limit of {} instructions", limit);
+                                break;
+                            }
+                        } else if trace_enabled && total_instructions % 1_000_000 == 0 {
+                            eprintln!("[RUN] executed {} instructions", total_instructions);
+                        }
                     }
                     Err(ExecError::Syscall) => {
                         if handle_syscall(&mut loaded.cpu, &mut loaded.mem).is_err() {
@@ -64,24 +82,47 @@ fn main() {
                         break;
                     }
                     Err(ExecError::UnimplementedOpcode(op, addr)) => {
-                        println!("\nEncountered unimplemented opcode 0x{:02x} at 0x{:08x}", op, addr);
-                        break;
-                    }
-                    Err(e) => {
-                        println!("\nExecution error: {}", e);
+                        println!(
+                            "\nEncountered unimplemented opcode 0x{:02x} at 0x{:08x}",
+                            op, addr
+                        );
                         break;
                     }
                     Err(ExecError::UnresolvedImportStub {
+                        eip,
+                        stub_index,
+                        indirect_symbol_index,
+                    }) => {
+                        if trace_enabled {
+                            let import_desc = loaded
+                                .dyld
+                                .describe_import(eip, indirect_symbol_index)
+                                .unwrap_or_else(|| "<unknown import>".to_string());
+                            eprintln!(
+                                "\nHit unresolved import stub: eip={:#010x}, stub_index={}, indirect_symbol_index={}, import={}",
+                                eip, stub_index, indirect_symbol_index, import_desc
+                            );
+                        }
+                        if let Err(err) = loaded.dyld.handle_unresolved_import(
+                            &mut loaded.cpu,
+                            &mut loaded.mem,
                             eip,
-                            stub_index,
                             indirect_symbol_index,
-                        }) => {
-                        eprintln!(
-                            "\n命中未解析导入跳板: eip={:#010x}, stub_index={}, indirect_symbol_index={}",
-                            eip,
-                            stub_index,
-                            indirect_symbol_index
-                        );
+                        ) {
+                            match err {
+                                DyldError::GuestExit(status) => {
+                                    eprintln!("Guest exited with status {}", status);
+                                    break;
+                                }
+                                other => {
+                                    eprintln!("dyld import handling failed: {}", other);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("\nExecution error: {}", e);
                         break;
                     }
                 }

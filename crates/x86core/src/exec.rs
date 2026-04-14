@@ -42,20 +42,37 @@ impl Cpu {
 
         let mut opcode = s.fetch_u8()?;
         let mut is_16bit = false;
+        let mut prefix_66 = false;
+        let mut prefix_f2 = false;
+        let mut prefix_f3 = false;
 
         // 1. 过滤掉指令前缀 (比如 0x66)
         loop {
             match opcode {
                 0x66 => {
+                    prefix_66 = true;
                     is_16bit = true;
                     opcode = s.fetch_u8()?;
                 }
                 // CS, DS, ES, SS 段覆盖前缀（在平坦内存模型中可以直接忽略）
-                0x2E | 0x3E | 0x26 | 0x36 => {
+                0x2E | 0x3E | 0x26 | 0x36 | 0x64 | 0x65 => {
+                    opcode = s.fetch_u8()?;
+                }
+                // 地址大小前缀：当前解释器仅实现 32 位地址模式，先忽略
+                0x67 => {
                     opcode = s.fetch_u8()?;
                 }
                 // F2, F3 是 REP 前缀，有时也用于对齐或分支预测提示
-                0xF2 | 0xF3 => {
+                0xF2 => {
+                    prefix_f2 = true;
+                    opcode = s.fetch_u8()?;
+                }
+                0xF3 => {
+                    prefix_f3 = true;
+                    opcode = s.fetch_u8()?;
+                }
+                // LOCK 前缀：当前单线程解释执行，原子语义可退化为普通操作
+                0xF0 => {
                     opcode = s.fetch_u8()?;
                 }
                 _ => break, // 遇到真正的操作码，跳出循环
@@ -66,9 +83,18 @@ impl Cpu {
             0x90 => {
                 // 原本的 0x90 NOP，直接放行
             }
+            0x91..=0x97 => {
+                // XCHG EAX, r32
+                let reg = opcode - 0x90;
+                let other = self.reg32(reg);
+                self.set_reg32(reg, self.eax);
+                self.eax = other;
+                self.eip = s.ip;
+                return Ok(());
+            }
             0xF4 => {
-                if let Some(stub_index) = self.import_stub_index(start) {
-                    let indirect_symbol_index = self.import_jump_table_reserved1 + stub_index;
+                if let Some(indirect_symbol_index) = self.import_indirect_symbol_index(start) {
+                    let stub_index = self.import_stub_index(start).unwrap_or(0);
                     return Err(ExecError::UnresolvedImportStub {
                         eip: start,
                         stub_index,
@@ -78,10 +104,241 @@ impl Cpu {
                     return Err(ExecError::Halt);
                 }
             }
+            0x00 | 0x08 | 0x20 | 0x28 | 0x30 | 0x38 => {
+                // r/m8 <- r8 (ADD/OR/AND/SUB/XOR/CMP)
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = self.read_operand8(mem, dst)?;
+                let rhs = self.reg8(modrm.reg);
+                let result = match opcode {
+                    0x00 => self.alu_add32(lhs as u32, rhs as u32) as u8,
+                    0x08 => self.alu_or32(lhs as u32, rhs as u32) as u8,
+                    0x20 => self.alu_and32(lhs as u32, rhs as u32) as u8,
+                    0x28 => self.alu_sub32(lhs as u32, rhs as u32) as u8,
+                    0x30 => self.alu_xor32(lhs as u32, rhs as u32) as u8,
+                    0x38 => self.alu_sub32(lhs as u32, rhs as u32) as u8, // CMP
+                    _ => unreachable!(),
+                };
+                self.eip = s.ip;
+                if opcode != 0x38 {
+                    self.write_operand8(mem, dst, result)?;
+                }
+                return Ok(());
+            }
+            0x02 | 0x0A | 0x22 | 0x2A | 0x32 | 0x3A => {
+                // r8 <- r/m8 (ADD/OR/AND/SUB/XOR/CMP)
+                let modrm = s.fetch_modrm()?;
+                let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = self.reg8(modrm.reg);
+                let rhs = self.read_operand8(mem, src)?;
+                let result = match opcode {
+                    0x02 => self.alu_add32(lhs as u32, rhs as u32) as u8,
+                    0x0A => self.alu_or32(lhs as u32, rhs as u32) as u8,
+                    0x22 => self.alu_and32(lhs as u32, rhs as u32) as u8,
+                    0x2A => self.alu_sub32(lhs as u32, rhs as u32) as u8,
+                    0x32 => self.alu_xor32(lhs as u32, rhs as u32) as u8,
+                    0x3A => self.alu_sub32(lhs as u32, rhs as u32) as u8, // CMP
+                    _ => unreachable!(),
+                };
+                self.eip = s.ip;
+                if opcode != 0x3A {
+                    self.set_reg8(modrm.reg, result);
+                }
+                return Ok(());
+            }
+            0x04 | 0x0C | 0x24 | 0x2C | 0x34 | 0x3C => {
+                // AL, imm8 (ADD/OR/AND/SUB/XOR/CMP)
+                let imm = s.fetch_u8()?;
+                let lhs = self.reg8(0);
+                let result = match opcode {
+                    0x04 => self.alu_add32(lhs as u32, imm as u32) as u8,
+                    0x0C => self.alu_or32(lhs as u32, imm as u32) as u8,
+                    0x24 => self.alu_and32(lhs as u32, imm as u32) as u8,
+                    0x2C => self.alu_sub32(lhs as u32, imm as u32) as u8,
+                    0x34 => self.alu_xor32(lhs as u32, imm as u32) as u8,
+                    0x3C => self.alu_sub32(lhs as u32, imm as u32) as u8, // CMP
+                    _ => unreachable!(),
+                };
+                self.eip = s.ip;
+                if opcode != 0x3C {
+                    self.set_reg8(0, result);
+                }
+                return Ok(());
+            }
+            0x05 | 0x0D | 0x25 | 0x2D | 0x35 | 0x3D => {
+                // EAX/AX, imm (ADD/OR/AND/SUB/XOR/CMP)
+                let imm = if is_16bit {
+                    s.fetch_u16()? as u32
+                } else {
+                    s.fetch_u32()?
+                };
+                let lhs = if is_16bit {
+                    self.eax & 0xFFFF
+                } else {
+                    self.eax
+                };
+                let result = match opcode {
+                    0x05 => self.alu_add32(lhs, imm),
+                    0x0D => self.alu_or32(lhs, imm),
+                    0x25 => self.alu_and32(lhs, imm),
+                    0x2D => self.alu_sub32(lhs, imm),
+                    0x35 => self.alu_xor32(lhs, imm),
+                    0x3D => self.alu_sub32(lhs, imm), // CMP
+                    _ => unreachable!(),
+                };
+                self.eip = s.ip;
+                if opcode != 0x3D {
+                    if is_16bit {
+                        self.eax = (self.eax & 0xFFFF_0000) | (result & 0xFFFF);
+                    } else {
+                        self.eax = result;
+                    }
+                }
+                return Ok(());
+            }
+            0x10 | 0x18 => {
+                // ADC/SBB r/m8, r8
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = self.read_operand8(mem, dst)?;
+                let rhs = self.reg8(modrm.reg);
+                let result = if opcode == 0x10 {
+                    self.alu_adc32(lhs as u32, rhs as u32) as u8
+                } else {
+                    self.alu_sbb32(lhs as u32, rhs as u32) as u8
+                };
+                self.eip = s.ip;
+                self.write_operand8(mem, dst, result)?;
+                return Ok(());
+            }
+            0x12 | 0x1A => {
+                // ADC/SBB r8, r/m8
+                let modrm = s.fetch_modrm()?;
+                let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = self.reg8(modrm.reg);
+                let rhs = self.read_operand8(mem, src)?;
+                let result = if opcode == 0x12 {
+                    self.alu_adc32(lhs as u32, rhs as u32) as u8
+                } else {
+                    self.alu_sbb32(lhs as u32, rhs as u32) as u8
+                };
+                self.eip = s.ip;
+                self.set_reg8(modrm.reg, result);
+                return Ok(());
+            }
+            0x14 | 0x1C => {
+                // ADC/SBB AL, imm8
+                let imm = s.fetch_u8()?;
+                let lhs = self.reg8(0);
+                let result = if opcode == 0x14 {
+                    self.alu_adc32(lhs as u32, imm as u32) as u8
+                } else {
+                    self.alu_sbb32(lhs as u32, imm as u32) as u8
+                };
+                self.eip = s.ip;
+                self.set_reg8(0, result);
+                return Ok(());
+            }
+            0x11 | 0x19 => {
+                // ADC/SBB r/m16|32, r16|32
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                self.eip = s.ip;
+                if is_16bit {
+                    let lhs = match dst {
+                        crate::decode::Operand32::Mem(addr) => self.read_u16(mem, addr)? as u32,
+                        crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                    };
+                    let rhs = self.reg32(modrm.reg) & 0xFFFF;
+                    let result = if opcode == 0x11 {
+                        self.alu_adc32(lhs, rhs)
+                    } else {
+                        self.alu_sbb32(lhs, rhs)
+                    } & 0xFFFF;
+                    match dst {
+                        crate::decode::Operand32::Mem(addr) => {
+                            mem.write(addr, &(result as u16).to_le_bytes())?
+                        }
+                        crate::decode::Operand32::Reg(r) => {
+                            let old = self.reg32(r);
+                            self.set_reg32(r, (old & 0xFFFF_0000) | result);
+                        }
+                    }
+                } else {
+                    let lhs = self.read_operand32(mem, dst)?;
+                    let rhs = self.reg32(modrm.reg);
+                    let result = if opcode == 0x11 {
+                        self.alu_adc32(lhs, rhs)
+                    } else {
+                        self.alu_sbb32(lhs, rhs)
+                    };
+                    self.write_operand32(mem, dst, result)?;
+                }
+                return Ok(());
+            }
+            0x13 | 0x1B => {
+                // ADC/SBB r16|32, r/m16|32
+                let modrm = s.fetch_modrm()?;
+                let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                if is_16bit {
+                    let lhs = self.reg32(modrm.reg) & 0xFFFF;
+                    let rhs = match src {
+                        crate::decode::Operand32::Mem(addr) => self.read_u16(mem, addr)? as u32,
+                        crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                    };
+                    let result = if opcode == 0x13 {
+                        self.alu_adc32(lhs, rhs)
+                    } else {
+                        self.alu_sbb32(lhs, rhs)
+                    } & 0xFFFF;
+                    let old = self.reg32(modrm.reg);
+                    self.set_reg32(modrm.reg, (old & 0xFFFF_0000) | result);
+                } else {
+                    let lhs = self.reg32(modrm.reg);
+                    let rhs = self.read_operand32(mem, src)?;
+                    let result = if opcode == 0x13 {
+                        self.alu_adc32(lhs, rhs)
+                    } else {
+                        self.alu_sbb32(lhs, rhs)
+                    };
+                    self.set_reg32(modrm.reg, result);
+                }
+                self.eip = s.ip;
+                return Ok(());
+            }
+            0x15 | 0x1D => {
+                // ADC/SBB AX/EAX, imm16|32
+                let imm = if is_16bit {
+                    s.fetch_u16()? as u32
+                } else {
+                    s.fetch_u32()?
+                };
+                self.eip = s.ip;
+                if is_16bit {
+                    let lhs = self.eax & 0xFFFF;
+                    let result = if opcode == 0x15 {
+                        self.alu_adc32(lhs, imm)
+                    } else {
+                        self.alu_sbb32(lhs, imm)
+                    } & 0xFFFF;
+                    self.eax = (self.eax & 0xFFFF_0000) | result;
+                } else {
+                    self.eax = if opcode == 0x15 {
+                        self.alu_adc32(self.eax, imm)
+                    } else {
+                        self.alu_sbb32(self.eax, imm)
+                    };
+                }
+                return Ok(());
+            }
 
             0x68 => {
                 // 致命修复：16位模式下 push 的是 2 字节立即数
-                let imm = if is_16bit { s.fetch_u16()? as u32 } else { s.fetch_u32()? };
+                let imm = if is_16bit {
+                    s.fetch_u16()? as u32
+                } else {
+                    s.fetch_u32()?
+                };
                 self.eip = s.ip;
 
                 if is_16bit {
@@ -98,6 +355,88 @@ impl Cpu {
                 self.push32(mem, imm)?;
                 return Ok(());
             }
+            0x69 => {
+                // IMUL r16|32, r/m16|32, imm16|32
+                let modrm = s.fetch_modrm()?;
+                let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = if is_16bit {
+                    match src {
+                        crate::decode::Operand32::Mem(addr) => self.read_u16(mem, addr)? as u32,
+                        crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                    }
+                } else {
+                    self.read_operand32(mem, src)?
+                };
+                let imm = if is_16bit {
+                    s.fetch_u16()? as u32
+                } else {
+                    s.fetch_u32()?
+                };
+                self.eip = s.ip;
+
+                if is_16bit {
+                    let res = ((lhs as i16) as i32).wrapping_mul((imm as i16) as i32) as u32;
+                    let old = self.reg32(modrm.reg);
+                    self.set_reg32(modrm.reg, (old & 0xFFFF_0000) | (res & 0xFFFF));
+                } else {
+                    let res = (lhs as i32).wrapping_mul(imm as i32) as u32;
+                    self.set_reg32(modrm.reg, res);
+                }
+                return Ok(());
+            }
+            0x6B => {
+                // IMUL r16|32, r/m16|32, imm8
+                let modrm = s.fetch_modrm()?;
+                let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = if is_16bit {
+                    match src {
+                        crate::decode::Operand32::Mem(addr) => self.read_u16(mem, addr)? as u32,
+                        crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                    }
+                } else {
+                    self.read_operand32(mem, src)?
+                };
+                let imm = s.fetch_i8()? as i32 as u32;
+                self.eip = s.ip;
+
+                if is_16bit {
+                    let res = ((lhs as i16) as i32).wrapping_mul((imm as i8) as i32) as u32;
+                    let old = self.reg32(modrm.reg);
+                    self.set_reg32(modrm.reg, (old & 0xFFFF_0000) | (res & 0xFFFF));
+                } else {
+                    let res = (lhs as i32).wrapping_mul(imm as i32) as u32;
+                    self.set_reg32(modrm.reg, res);
+                }
+                return Ok(());
+            }
+            0x60 => {
+                // PUSHAD
+                let next_ip = s.ip;
+                self.eip = next_ip;
+                let original_esp = self.esp;
+                self.push32(mem, self.eax)?;
+                self.push32(mem, self.ecx)?;
+                self.push32(mem, self.edx)?;
+                self.push32(mem, self.ebx)?;
+                self.push32(mem, original_esp)?;
+                self.push32(mem, self.ebp)?;
+                self.push32(mem, self.esi)?;
+                self.push32(mem, self.edi)?;
+                return Ok(());
+            }
+            0x61 => {
+                // POPAD
+                self.edi = self.pop32(mem)?;
+                self.esi = self.pop32(mem)?;
+                self.ebp = self.pop32(mem)?;
+                let _ignored_esp = self.pop32(mem)?;
+                self.ebx = self.pop32(mem)?;
+                self.edx = self.pop32(mem)?;
+                self.ecx = self.pop32(mem)?;
+                self.eax = self.pop32(mem)?;
+                self.eip = s.ip;
+                return Ok(());
+            }
             0x50..=0x57 => {
                 let reg = opcode - 0x50;
                 let val = self.reg32(reg);
@@ -110,6 +449,33 @@ impl Cpu {
                 self.eip = s.ip;
                 let value = self.pop32(mem)?;
                 self.set_reg32(reg, value);
+                return Ok(());
+            }
+            0x8F => {
+                // POP r/m16|32
+                let modrm = s.fetch_modrm()?;
+                if modrm.reg != 0 {
+                    return Err(ExecError::UnimplementedOpcode(opcode, start));
+                }
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                self.eip = s.ip;
+
+                if is_16bit {
+                    let value = self.read_u16(mem, self.esp)? as u32;
+                    self.esp = self.esp.wrapping_add(2);
+                    match dst {
+                        crate::decode::Operand32::Mem(addr) => {
+                            mem.write(addr, &(value as u16).to_le_bytes())?
+                        }
+                        crate::decode::Operand32::Reg(r) => {
+                            let old = self.reg32(r);
+                            self.set_reg32(r, (old & 0xFFFF_0000) | (value & 0xFFFF));
+                        }
+                    }
+                } else {
+                    let value = self.pop32(mem)?;
+                    self.write_operand32(mem, dst, value)?;
+                }
                 return Ok(());
             }
 
@@ -133,7 +499,11 @@ impl Cpu {
             0xB8..=0xBF => {
                 let reg = opcode - 0xB8;
                 // 致命修复：如果是 16 位模式，只能读 2 字节！否则 EIP 会错位！
-                let imm = if is_16bit { s.fetch_u16()? as u32 } else { s.fetch_u32()? };
+                let imm = if is_16bit {
+                    s.fetch_u16()? as u32
+                } else {
+                    s.fetch_u32()?
+                };
                 self.eip = s.ip;
 
                 if is_16bit {
@@ -144,6 +514,14 @@ impl Cpu {
                 }
                 return Ok(());
             }
+            0xB0..=0xB7 => {
+                // MOV r8, imm8
+                let reg = opcode - 0xB0;
+                let imm = s.fetch_u8()?;
+                self.eip = s.ip;
+                self.set_reg8(reg, imm);
+                return Ok(());
+            }
             0x89 => {
                 let modrm = s.fetch_modrm()?;
                 let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
@@ -152,7 +530,9 @@ impl Cpu {
 
                 if is_16bit {
                     match &dst {
-                        crate::decode::Operand32::Mem(addr) => mem.write(*addr, &(src as u16).to_le_bytes())?,
+                        crate::decode::Operand32::Mem(addr) => {
+                            mem.write(*addr, &(src as u16).to_le_bytes())?
+                        }
                         crate::decode::Operand32::Reg(r) => {
                             let old = self.reg32(*r);
                             self.set_reg32(*r, (old & 0xFFFF0000) | (src & 0xFFFF));
@@ -183,10 +563,46 @@ impl Cpu {
                     self.set_reg32(modrm.reg, value);
                 }
             }
-            0x8D => { // LEA
+            0x87 => {
+                // XCHG r/m16|32, r16|32
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                self.eip = s.ip;
+
+                if is_16bit {
+                    let lhs16 = match dst {
+                        crate::decode::Operand32::Mem(addr) => self.read_u16(mem, addr)? as u32,
+                        crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                    };
+                    let rhs16 = self.reg32(modrm.reg) & 0xFFFF;
+
+                    match dst {
+                        crate::decode::Operand32::Mem(addr) => {
+                            mem.write(addr, &(rhs16 as u16).to_le_bytes())?
+                        }
+                        crate::decode::Operand32::Reg(r) => {
+                            let old = self.reg32(r);
+                            self.set_reg32(r, (old & 0xFFFF_0000) | rhs16);
+                        }
+                    }
+                    let old_reg = self.reg32(modrm.reg);
+                    self.set_reg32(modrm.reg, (old_reg & 0xFFFF_0000) | lhs16);
+                } else {
+                    let lhs = self.read_operand32(mem, dst)?;
+                    let rhs = self.reg32(modrm.reg);
+                    self.write_operand32(mem, dst, rhs)?;
+                    self.set_reg32(modrm.reg, lhs);
+                }
+                return Ok(());
+            }
+            0x8D => {
+                // LEA
                 let modrm = s.fetch_modrm()?;
                 if modrm.mod_ == 0b11 {
-                    return Err(ExecError::InvalidInstruction(start, "lea requires memory operand"));
+                    return Err(ExecError::InvalidInstruction(
+                        start,
+                        "lea requires memory operand",
+                    ));
                 }
                 let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
                 self.eip = s.ip; // 必须加上这行！
@@ -197,13 +613,52 @@ impl Cpu {
                 let addr = s.fetch_u32()?;
                 self.eax = self.read_u32(mem, addr)?;
             }
+            0xA0 => {
+                // MOV AL, moffs8
+                let addr = s.fetch_u32()?;
+                self.eip = s.ip;
+                let value = self.read_u8(mem, addr)?;
+                self.set_reg8(0, value);
+                return Ok(());
+            }
             0xA3 => {
                 let addr = s.fetch_u32()?;
                 self.eip = s.ip;
                 self.write_u32(mem, addr, self.eax)?;
                 return Ok(());
             }
-            0xC6 => { // MOV r/m8, imm8
+            0xA2 => {
+                // MOV moffs8, AL
+                let addr = s.fetch_u32()?;
+                self.eip = s.ip;
+                self.write_u8(mem, addr, self.reg8(0))?;
+                return Ok(());
+            }
+            0xA8 => {
+                // TEST AL, imm8
+                let imm = s.fetch_u8()?;
+                self.eip = s.ip;
+                let _ = self.alu_and32(self.reg8(0) as u32, imm as u32);
+                return Ok(());
+            }
+            0xA9 => {
+                // TEST AX/EAX, imm
+                let imm = if is_16bit {
+                    s.fetch_u16()? as u32
+                } else {
+                    s.fetch_u32()?
+                };
+                self.eip = s.ip;
+                let lhs = if is_16bit {
+                    self.eax & 0xFFFF
+                } else {
+                    self.eax
+                };
+                let _ = self.alu_and32(lhs, imm);
+                return Ok(());
+            }
+            0xC6 => {
+                // MOV r/m8, imm8
                 let modrm = s.fetch_modrm()?;
                 // 对于 MOV r/m8, imm8，扩展的 reg 字段必须是 0
                 if modrm.reg != 0 {
@@ -244,12 +699,18 @@ impl Cpu {
                 let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
 
                 // 16位前缀时，只读取 2 字节的立即数
-                let imm = if is_16bit { s.fetch_u16()? as u32 } else { s.fetch_u32()? };
+                let imm = if is_16bit {
+                    s.fetch_u16()? as u32
+                } else {
+                    s.fetch_u32()?
+                };
                 self.eip = s.ip;
 
                 if is_16bit {
                     match &dst {
-                        crate::decode::Operand32::Mem(addr) => mem.write(*addr, &(imm as u16).to_le_bytes())?,
+                        crate::decode::Operand32::Mem(addr) => {
+                            mem.write(*addr, &(imm as u16).to_le_bytes())?
+                        }
                         crate::decode::Operand32::Reg(r) => {
                             let old = self.reg32(*r);
                             self.set_reg32(*r, (old & 0xFFFF0000) | (imm & 0xFFFF));
@@ -358,7 +819,7 @@ impl Cpu {
             0x39 => {
                 let modrm = s.fetch_modrm()?;
                 let op = self.decode_rm32_operand(mem, &mut s, modrm)?; // 拆分1
-                let lhs = self.read_operand32(mem, op)?;                // 拆分2
+                let lhs = self.read_operand32(mem, op)?; // 拆分2
                 let rhs = self.reg32(modrm.reg);
                 let _ = self.alu_sub32(lhs, rhs);
             }
@@ -366,11 +827,12 @@ impl Cpu {
                 let modrm = s.fetch_modrm()?;
                 let lhs = self.reg32(modrm.reg);
                 let op = self.decode_rm32_operand(mem, &mut s, modrm)?; // 拆分1
-                let rhs = self.read_operand32(mem, op)?;                // 拆分2
+                let rhs = self.read_operand32(mem, op)?; // 拆分2
                 let _ = self.alu_sub32(lhs, rhs);
             }
 
-            0x80 | 0x82 => { // Group 1: 8位 ALU 运算 (ADD, OR, AND, SUB, XOR, CMP)
+            0x80 | 0x82 => {
+                // Group 1: 8位 ALU 运算 (ADD, OR, AND, SUB, XOR, CMP)
                 let modrm = s.fetch_modrm()?;
                 let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
                 let imm = s.fetch_u8()?;
@@ -382,8 +844,11 @@ impl Cpu {
                     crate::decode::Operand32::Mem(addr) => self.read_u8(mem, *addr)?,
                     crate::decode::Operand32::Reg(r) => {
                         let base = r % 4;
-                        if *r < 4 { (self.reg32(base) & 0xFF) as u8 }
-                        else { ((self.reg32(base) >> 8) & 0xFF) as u8 }
+                        if *r < 4 {
+                            (self.reg32(base) & 0xFF) as u8
+                        } else {
+                            ((self.reg32(base) >> 8) & 0xFF) as u8
+                        }
                     }
                 };
 
@@ -419,71 +884,71 @@ impl Cpu {
                 }
                 return Ok(());
             }
-            0x88 => { // MOV r/m8, r8 (写 8 位寄存器到内存/寄存器)
+            0xFE => {
+                // Group 4: INC/DEC r/m8
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = self.read_operand8(mem, dst)? as u32;
+                let old_cf = Flags::get(self.eflags, Flags::CF);
+                let result = match modrm.reg {
+                    0 => self.alu_add32(lhs, 1) as u8,
+                    1 => self.alu_sub32(lhs, 1) as u8,
+                    _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                };
+                Flags::set(&mut self.eflags, Flags::CF, old_cf);
+                self.eip = s.ip;
+                self.write_operand8(mem, dst, result)?;
+                return Ok(());
+            }
+            0x88 => {
+                // MOV r/m8, r8 (写 8 位寄存器到内存/寄存器)
                 let modrm = s.fetch_modrm()?;
                 let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
 
                 // src 必定是 8 位寄存器
-                let r = modrm.reg;
-                let base = r % 4;
-                let val8 = if r < 4 {
-                    (self.reg32(base) & 0xFF) as u8
-                } else {
-                    ((self.reg32(base) >> 8) & 0xFF) as u8
-                };
+                let val8 = self.reg8(modrm.reg);
 
                 self.eip = s.ip;
-                match dst {
-                    crate::decode::Operand32::Mem(addr) => {
-                        mem.write(addr, &[val8])?;
-                    }
-                    crate::decode::Operand32::Reg(dst_r) => {
-                        let dst_base = dst_r % 4;
-                        let mut val32 = self.reg32(dst_base);
-                        if dst_r < 4 {
-                            val32 = (val32 & 0xFFFFFF00) | (val8 as u32);
-                        } else {
-                            val32 = (val32 & 0xFFFF00FF) | ((val8 as u32) << 8);
-                        }
-                        self.set_reg32(dst_base, val32);
-                    }
-                }
+                self.write_operand8(mem, dst, val8)?;
+                return Ok(());
+            }
+            0x86 => {
+                // XCHG r/m8, r8
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = self.read_operand8(mem, dst)?;
+                let rhs = self.reg8(modrm.reg);
+                self.eip = s.ip;
+                self.write_operand8(mem, dst, rhs)?;
+                self.set_reg8(modrm.reg, lhs);
                 return Ok(());
             }
 
-            0x8A => { // MOV r8, r/m8 (从内存/寄存器读到 8 位寄存器)
+            0x8A => {
+                // MOV r8, r/m8 (从内存/寄存器读到 8 位寄存器)
                 let modrm = s.fetch_modrm()?;
                 let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
 
                 self.eip = s.ip;
-                let val8 = match src {
-                    crate::decode::Operand32::Mem(addr) => self.read_u8(mem, addr)?,
-                    crate::decode::Operand32::Reg(r) => {
-                        let base = r % 4;
-                        if r < 4 {
-                            (self.reg32(base) & 0xFF) as u8
-                        } else {
-                            ((self.reg32(base) >> 8) & 0xFF) as u8
-                        }
-                    }
-                };
-
-                let dst_r = modrm.reg;
-                let dst_base = dst_r % 4;
-                let mut val32 = self.reg32(dst_base);
-                if dst_r < 4 {
-                    val32 = (val32 & 0xFFFFFF00) | (val8 as u32);
-                } else {
-                    val32 = (val32 & 0xFFFF00FF) | ((val8 as u32) << 8);
-                }
-                self.set_reg32(dst_base, val32);
+                let val8 = self.read_operand8(mem, src)?;
+                self.set_reg8(modrm.reg, val8);
+                return Ok(());
+            }
+            0x84 => {
+                // TEST r/m8, r8
+                let modrm = s.fetch_modrm()?;
+                let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                let lhs = self.read_operand8(mem, src)? as u32;
+                let rhs = self.reg8(modrm.reg) as u32;
+                self.eip = s.ip;
+                let _ = self.alu_and32(lhs, rhs);
                 return Ok(());
             }
 
             0x85 => {
                 let modrm = s.fetch_modrm()?;
                 let op = self.decode_rm32_operand(mem, &mut s, modrm)?; // 拆分1
-                let lhs = self.read_operand32(mem, op)?;                // 拆分2
+                let lhs = self.read_operand32(mem, op)?; // 拆分2
                 let rhs = self.reg32(modrm.reg);
                 let _ = self.alu_and32(lhs, rhs);
             }
@@ -502,7 +967,11 @@ impl Cpu {
                 };
 
                 let imm = if opcode == 0x81 {
-                    if is_16bit { s.fetch_u16()? as u32 } else { s.fetch_u32()? }
+                    if is_16bit {
+                        s.fetch_u16()? as u32
+                    } else {
+                        s.fetch_u32()?
+                    }
                 } else {
                     s.fetch_i8()? as i32 as u32
                 };
@@ -519,10 +988,13 @@ impl Cpu {
 
                 self.eip = s.ip;
 
-                if modrm.reg != 7 { // 如果不是 CMP，写回结果
+                if modrm.reg != 7 {
+                    // 如果不是 CMP，写回结果
                     if is_16bit {
                         match &dst {
-                            crate::decode::Operand32::Mem(addr) => mem.write(*addr, &(result as u16).to_le_bytes())?,
+                            crate::decode::Operand32::Mem(addr) => {
+                                mem.write(*addr, &(result as u16).to_le_bytes())?
+                            }
                             crate::decode::Operand32::Reg(r) => {
                                 let old = self.reg32(*r);
                                 self.set_reg32(*r, (old & 0xFFFF0000) | (result & 0xFFFF));
@@ -534,54 +1006,185 @@ impl Cpu {
                 }
                 return Ok(());
             }
-            0x99 => { // CDQ (Convert Double to Quad) - 这个指令经常紧挨着 IDIV 出现，用于将 EAX 的符号位扩展到 EDX
-                self.edx = if (self.eax & 0x80000000) != 0 { 0xFFFFFFFF } else { 0 };
+            0x99 => {
+                // CDQ (Convert Double to Quad) - 这个指令经常紧挨着 IDIV 出现，用于将 EAX 的符号位扩展到 EDX
+                self.edx = if (self.eax & 0x80000000) != 0 {
+                    0xFFFFFFFF
+                } else {
+                    0
+                };
+            }
+            0x9C => {
+                // PUSHFD
+                self.eip = s.ip;
+                self.push32(mem, self.eflags)?;
+                return Ok(());
+            }
+            0x9D => {
+                // POPFD
+                self.eip = s.ip;
+                self.eflags = self.pop32(mem)?;
+                return Ok(());
+            }
+            0xF8 => {
+                Flags::set(&mut self.eflags, Flags::CF, false); // CLC
+                self.eip = s.ip;
+                return Ok(());
+            }
+            0xF9 => {
+                Flags::set(&mut self.eflags, Flags::CF, true); // STC
+                self.eip = s.ip;
+                return Ok(());
+            }
+            0xFA => {
+                // CLI: user-mode emulation中不模拟中断屏蔽，按 NOP 处理。
+                self.eip = s.ip;
+                return Ok(());
+            }
+            0xFB => {
+                // STI: user-mode emulation中不模拟中断屏蔽，按 NOP 处理。
+                self.eip = s.ip;
+                return Ok(());
+            }
+            0xFC => {
+                Flags::set(&mut self.eflags, Flags::DF, false); // CLD
+                self.eip = s.ip;
+                return Ok(());
+            }
+            0xFD => {
+                Flags::set(&mut self.eflags, Flags::DF, true); // STD
+                self.eip = s.ip;
+                return Ok(());
+            }
+            0xF6 => {
+                // Group 3: 8-bit TEST/NOT/NEG/MUL/IMUL/DIV/IDIV
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+
+                let imm = if modrm.reg == 0 { s.fetch_u8()? } else { 0 };
+                let val = self.read_operand8(mem, dst)?;
+                self.eip = s.ip;
+
+                match modrm.reg {
+                    0 => {
+                        let _ = self.alu_and32(val as u32, imm as u32); // TEST
+                    }
+                    2 => {
+                        self.write_operand8(mem, dst, !val)?; // NOT
+                    }
+                    3 => {
+                        let result = self.alu_sub32(0, val as u32) as u8; // NEG
+                        self.write_operand8(mem, dst, result)?;
+                    }
+                    4 => {
+                        // MUL r/m8: AX = AL * r/m8
+                        let al = self.reg8(0);
+                        let res = (al as u16).wrapping_mul(val as u16);
+                        self.set_reg8(0, (res & 0x00FF) as u8); // AL
+                        self.set_reg8(4, (res >> 8) as u8); // AH
+                    }
+                    5 => {
+                        // IMUL r/m8: AX = AL * r/m8 (signed)
+                        let al = self.reg8(0) as i8 as i16;
+                        let rhs = val as i8 as i16;
+                        let res = al.wrapping_mul(rhs) as u16;
+                        self.set_reg8(0, (res & 0x00FF) as u8);
+                        self.set_reg8(4, (res >> 8) as u8);
+                    }
+                    6 => {
+                        // DIV r/m8: AX / r/m8 => AL=quot, AH=rem
+                        if val == 0 {
+                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                        }
+                        let dividend = ((self.reg8(4) as u16) << 8) | (self.reg8(0) as u16);
+                        let quot = dividend / (val as u16);
+                        let rem = dividend % (val as u16);
+                        self.set_reg8(0, quot as u8);
+                        self.set_reg8(4, rem as u8);
+                    }
+                    7 => {
+                        // IDIV r/m8: AX / r/m8 => AL=quot, AH=rem (signed)
+                        if val == 0 {
+                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                        }
+                        let dividend =
+                            (((self.reg8(4) as u16) << 8) | (self.reg8(0) as u16)) as i16;
+                        let divisor = val as i8 as i16;
+                        if dividend == i16::MIN && divisor == -1 {
+                            return Err(ExecError::InvalidInstruction(start, "division overflow"));
+                        }
+                        let quot = dividend / divisor;
+                        let rem = dividend % divisor;
+                        self.set_reg8(0, quot as u8);
+                        self.set_reg8(4, rem as u8);
+                    }
+                    _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                }
+                return Ok(());
             }
 
-            0xF7 => { // Group 3: MUL, IMUL, DIV, IDIV, NEG, NOT, TEST
+            0xF7 => {
+                // Group 3: MUL, IMUL, DIV, IDIV, NEG, NOT, TEST
                 let modrm = s.fetch_modrm()?;
                 let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
 
                 // 致命修复：TEST 指令后面跟着立即数，16位模式下只有 2 字节！
                 let imm = if modrm.reg == 0 {
-                    if is_16bit { s.fetch_u16()? as u32 } else { s.fetch_u32()? }
-                } else { 0 };
+                    if is_16bit {
+                        s.fetch_u16()? as u32
+                    } else {
+                        s.fetch_u32()?
+                    }
+                } else {
+                    0
+                };
 
                 let val = self.read_operand32(mem, dst)?;
                 self.eip = s.ip; // 释放 mem 借用
 
                 match modrm.reg {
-                    0 => { // TEST r/m32, imm32
+                    0 => {
+                        // TEST r/m32, imm32
                         let _ = self.alu_and32(val, imm);
                     }
-                    2 => { // NOT r/m32
+                    2 => {
+                        // NOT r/m32
                         let result = !val;
                         self.write_operand32(mem, dst, result)?;
                     }
-                    3 => { // NEG r/m32
+                    3 => {
+                        // NEG r/m32
                         let result = self.alu_sub32(0, val);
                         self.write_operand32(mem, dst, result)?;
                     }
-                    4 => { // MUL r/m32 (无符号乘法，结果存入 EDX:EAX)
+                    4 => {
+                        // MUL r/m32 (无符号乘法，结果存入 EDX:EAX)
                         let res = (self.eax as u64).wrapping_mul(val as u64);
                         self.eax = res as u32;
                         self.edx = (res >> 32) as u32;
                     }
-                    5 => { // IMUL r/m32 (有符号乘法)
+                    5 => {
+                        // IMUL r/m32 (有符号乘法)
                         let res = (self.eax as i32 as i64).wrapping_mul(val as i32 as i64);
                         self.eax = res as u32;
                         self.edx = (res >> 32) as u32;
                     }
-                    6 => { // DIV r/m32 (无符号除法，EDX:EAX / r/m32)
-                        if val == 0 { return Err(ExecError::InvalidInstruction(start, "division by zero")); }
+                    6 => {
+                        // DIV r/m32 (无符号除法，EDX:EAX / r/m32)
+                        if val == 0 {
+                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                        }
                         let dividend = ((self.edx as u64) << 32) | (self.eax as u64);
                         let quot = dividend / (val as u64);
                         let rem = dividend % (val as u64);
                         self.eax = quot as u32;
                         self.edx = rem as u32;
                     }
-                    7 => { // IDIV r/m32 (有符号除法)
-                        if val == 0 { return Err(ExecError::InvalidInstruction(start, "division by zero")); }
+                    7 => {
+                        // IDIV r/m32 (有符号除法)
+                        if val == 0 {
+                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                        }
                         let dividend = ((self.edx as u64) << 32) | (self.eax as u64);
                         let dividend_signed = dividend as i64;
                         let divisor_signed = (val as i32) as i64;
@@ -600,6 +1203,132 @@ impl Cpu {
                 }
                 return Ok(());
             }
+            0xFF => {
+                // Group 5: INC, DEC, CALL, JMP, PUSH
+                let modrm = s.fetch_modrm()?;
+                let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+
+                match modrm.reg {
+                    0 => {
+                        // INC r/m16/32 (CF unchanged)
+                        let lhs = if is_16bit {
+                            match dst {
+                                crate::decode::Operand32::Mem(addr) => {
+                                    self.read_u16(mem, addr)? as u32
+                                }
+                                crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                            }
+                        } else {
+                            self.read_operand32(mem, dst)?
+                        };
+                        let old_cf = Flags::get(self.eflags, Flags::CF);
+                        let result = self.alu_add32(lhs, 1);
+                        Flags::set(&mut self.eflags, Flags::CF, old_cf);
+                        self.eip = s.ip;
+
+                        if is_16bit {
+                            match dst {
+                                crate::decode::Operand32::Mem(addr) => {
+                                    mem.write(addr, &(result as u16).to_le_bytes())?
+                                }
+                                crate::decode::Operand32::Reg(r) => {
+                                    let old = self.reg32(r);
+                                    self.set_reg32(r, (old & 0xFFFF_0000) | (result & 0xFFFF));
+                                }
+                            }
+                        } else {
+                            self.write_operand32(mem, dst, result)?;
+                        }
+                        return Ok(());
+                    }
+                    1 => {
+                        // DEC r/m16/32 (CF unchanged)
+                        let lhs = if is_16bit {
+                            match dst {
+                                crate::decode::Operand32::Mem(addr) => {
+                                    self.read_u16(mem, addr)? as u32
+                                }
+                                crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                            }
+                        } else {
+                            self.read_operand32(mem, dst)?
+                        };
+                        let old_cf = Flags::get(self.eflags, Flags::CF);
+                        let result = self.alu_sub32(lhs, 1);
+                        Flags::set(&mut self.eflags, Flags::CF, old_cf);
+                        self.eip = s.ip;
+
+                        if is_16bit {
+                            match dst {
+                                crate::decode::Operand32::Mem(addr) => {
+                                    mem.write(addr, &(result as u16).to_le_bytes())?
+                                }
+                                crate::decode::Operand32::Reg(r) => {
+                                    let old = self.reg32(r);
+                                    self.set_reg32(r, (old & 0xFFFF_0000) | (result & 0xFFFF));
+                                }
+                            }
+                        } else {
+                            self.write_operand32(mem, dst, result)?;
+                        }
+                        return Ok(());
+                    }
+                    2 => {
+                        // CALL r/m16/32 (near absolute)
+                        let target = if is_16bit {
+                            match dst {
+                                crate::decode::Operand32::Mem(addr) => {
+                                    self.read_u16(mem, addr)? as u32
+                                }
+                                crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                            }
+                        } else {
+                            self.read_operand32(mem, dst)?
+                        };
+                        let return_eip = s.ip;
+                        self.push32(mem, return_eip)?;
+                        self.eip = if is_16bit { target & 0xFFFF } else { target };
+                        return Ok(());
+                    }
+                    4 => {
+                        // JMP r/m16/32 (near absolute)
+                        let target = if is_16bit {
+                            match dst {
+                                crate::decode::Operand32::Mem(addr) => {
+                                    self.read_u16(mem, addr)? as u32
+                                }
+                                crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                            }
+                        } else {
+                            self.read_operand32(mem, dst)?
+                        };
+                        self.eip = if is_16bit { target & 0xFFFF } else { target };
+                        return Ok(());
+                    }
+                    6 => {
+                        // PUSH r/m16/32
+                        let value = if is_16bit {
+                            match dst {
+                                crate::decode::Operand32::Mem(addr) => {
+                                    self.read_u16(mem, addr)? as u32
+                                }
+                                crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                            }
+                        } else {
+                            self.read_operand32(mem, dst)?
+                        };
+                        self.eip = s.ip;
+                        if is_16bit {
+                            self.esp = self.esp.wrapping_sub(2);
+                            mem.write(self.esp, &(value as u16).to_le_bytes())?;
+                        } else {
+                            self.push32(mem, value)?;
+                        }
+                        return Ok(());
+                    }
+                    _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                }
+            }
 
             0xE8 => {
                 let rel = s.fetch_i32()?;
@@ -610,33 +1339,49 @@ impl Cpu {
                 self.push32(mem, return_eip)?;
                 return Ok(());
             }
-            0xC1 | 0xD1 | 0xD3 => { // Group 2: 移位指令 (SHL, SHR, SAR, ROL, ROR)
+            0xC0 | 0xD0 | 0xD2 | 0xC1 | 0xD1 | 0xD3 => {
+                // Group 2: 移位指令 (SHL, SHR, SAR, ROL, ROR)
                 let modrm = s.fetch_modrm()?;
                 let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
-                let val = self.read_operand32(mem, dst)?;
+                let is_8bit = matches!(opcode, 0xC0 | 0xD0 | 0xD2);
 
                 // 确定要移动的位数
                 let count = match opcode {
-                    0xC1 => s.fetch_u8()? & 0x1F,       // 立即数移位 (x86 规定最多移 31 位)
-                    0xD1 => 1,                          // 固定移 1 位
-                    0xD3 => (self.ecx & 0x1F) as u8,    // 根据 CL 寄存器移位
+                    0xC0 | 0xC1 => s.fetch_u8()? & 0x1F,    // 立即数移位
+                    0xD0 | 0xD1 => 1,                       // 固定移 1 位
+                    0xD2 | 0xD3 => (self.ecx & 0x1F) as u8, // 根据 CL 寄存器移位
                     _ => 0,
                 };
 
                 self.eip = s.ip; // 释放 mem 借用
 
                 if count > 0 {
-                    let result = match modrm.reg {
-                        0 => val.rotate_left(count as u32),  // ROL
-                        1 => val.rotate_right(count as u32), // ROR
-                        // RCL 和 RCR 涉及进位标志位，较复杂且这里用不到，暂时屏蔽
-                        2 | 3 => return Err(ExecError::UnimplementedOpcode(opcode, start)),
-                        4 | 6 => val << count,               // SHL / SAL (逻辑/算术左移)
-                        5 => val >> count,                   // SHR (逻辑右移，高位补 0)
-                        7 => (val as i32 >> count) as u32,   // SAR (算术右移，高位补符号位)
-                        _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
-                    };
-                    self.write_operand32(mem, dst, result)?;
+                    if is_8bit {
+                        let val = self.read_operand8(mem, dst)?;
+                        let result = match modrm.reg {
+                            0 => val.rotate_left(count as u32),  // ROL
+                            1 => val.rotate_right(count as u32), // ROR
+                            2 | 3 => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                            4 | 6 => val.wrapping_shl(count as u32), // SHL/SAL
+                            5 => val >> count,                       // SHR
+                            7 => ((val as i8) >> count) as u8,       // SAR
+                            _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                        };
+                        self.write_operand8(mem, dst, result)?;
+                    } else {
+                        let val = self.read_operand32(mem, dst)?;
+                        let result = match modrm.reg {
+                            0 => val.rotate_left(count as u32),  // ROL
+                            1 => val.rotate_right(count as u32), // ROR
+                            // RCL 和 RCR 涉及进位标志位，较复杂且这里用不到，暂时屏蔽
+                            2 | 3 => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                            4 | 6 => val << count,             // SHL / SAL
+                            5 => val >> count,                 // SHR
+                            7 => (val as i32 >> count) as u32, // SAR
+                            _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                        };
+                        self.write_operand32(mem, dst, result)?;
+                    }
                 }
                 return Ok(());
             }
@@ -657,6 +1402,111 @@ impl Cpu {
                 self.ebp = self.pop32(mem)?;
                 return Ok(());
             }
+            0xD9 => {
+                // x87: FLD/FST/FSTP m32real
+                let modrm = s.fetch_modrm()?;
+                if modrm.mod_ == 0b11 {
+                    return Err(ExecError::UnimplementedOpcode(opcode, start));
+                }
+                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                self.eip = s.ip;
+                match modrm.reg {
+                    0 => {
+                        let mut buf = [0u8; 4];
+                        mem.read(addr, &mut buf)?;
+                        self.fpu_push(f32::from_le_bytes(buf) as f64);
+                    }
+                    2 => {
+                        let v = self.fpu_peek() as f32;
+                        mem.write(addr, &v.to_le_bytes())?;
+                    }
+                    3 => {
+                        let v = self.fpu_pop() as f32;
+                        mem.write(addr, &v.to_le_bytes())?;
+                    }
+                    _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                }
+                return Ok(());
+            }
+            0xDB => {
+                // x87: FILD/FIST/FISTP m32int
+                let modrm = s.fetch_modrm()?;
+                if modrm.mod_ == 0b11 {
+                    return Err(ExecError::UnimplementedOpcode(opcode, start));
+                }
+                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                self.eip = s.ip;
+                match modrm.reg {
+                    0 => {
+                        let mut buf = [0u8; 4];
+                        mem.read(addr, &mut buf)?;
+                        self.fpu_push(i32::from_le_bytes(buf) as f64);
+                    }
+                    2 => {
+                        let v = self.fpu_peek() as i32;
+                        mem.write(addr, &v.to_le_bytes())?;
+                    }
+                    3 => {
+                        let v = self.fpu_pop() as i32;
+                        mem.write(addr, &v.to_le_bytes())?;
+                    }
+                    _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                }
+                return Ok(());
+            }
+            0xDD => {
+                // x87: FLD/FST/FSTP m64real
+                let modrm = s.fetch_modrm()?;
+                if modrm.mod_ == 0b11 {
+                    return Err(ExecError::UnimplementedOpcode(opcode, start));
+                }
+                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                self.eip = s.ip;
+                match modrm.reg {
+                    0 => {
+                        let mut buf = [0u8; 8];
+                        mem.read(addr, &mut buf)?;
+                        self.fpu_push(f64::from_le_bytes(buf));
+                    }
+                    2 => {
+                        let v = self.fpu_peek();
+                        mem.write(addr, &v.to_le_bytes())?;
+                    }
+                    3 => {
+                        let v = self.fpu_pop();
+                        mem.write(addr, &v.to_le_bytes())?;
+                    }
+                    _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                }
+                return Ok(());
+            }
+            0xDF => {
+                // x87: FILD/FISTP m16|m64int
+                let modrm = s.fetch_modrm()?;
+                if modrm.mod_ == 0b11 {
+                    return Err(ExecError::UnimplementedOpcode(opcode, start));
+                }
+                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                self.eip = s.ip;
+                match modrm.reg {
+                    0 => {
+                        let mut buf = [0u8; 2];
+                        mem.read(addr, &mut buf)?;
+                        self.fpu_push(i16::from_le_bytes(buf) as f64);
+                    }
+                    5 => {
+                        let mut buf = [0u8; 8];
+                        mem.read(addr, &mut buf)?;
+                        self.fpu_push(i64::from_le_bytes(buf) as f64);
+                    }
+                    7 => {
+                        let v = self.fpu_pop() as i64;
+                        mem.write(addr, &v.to_le_bytes())?;
+                    }
+                    _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
+                }
+                return Ok(());
+            }
             0xE9 => {
                 let rel = s.fetch_i32()?;
                 s.ip = s.ip.wrapping_add(rel as u32);
@@ -675,10 +1525,117 @@ impl Cpu {
             0x0F => {
                 let op2 = s.fetch_u8()?;
                 match op2 {
-                    0x1F => { // Multi-byte NOP (经常配合 0x66 用作循环对齐)
+                    0x1F => {
+                        // Multi-byte NOP (经常配合 0x66 用作循环对齐)
                         let modrm = s.fetch_modrm()?;
                         let _ = self.decode_rm32_operand(mem, &mut s, modrm)?;
                         self.eip = s.ip;
+                        return Ok(());
+                    }
+                    0x31 => {
+                        // RDTSC
+                        self.tsc = self.tsc.wrapping_add(1_000);
+                        self.eax = self.tsc as u32;
+                        self.edx = (self.tsc >> 32) as u32;
+                        self.eip = s.ip;
+                        return Ok(());
+                    }
+                    0xA2 => {
+                        // CPUID
+                        let leaf = self.eax;
+                        let subleaf = self.ecx;
+                        let (eax, ebx, ecx, edx) = match leaf {
+                            0x0000_0000 => (
+                                0x0000_0001, // max basic leaf
+                                0x756e6547, // "Genu"
+                                0x6c65746e, // "ntel"
+                                0x49656e69, // "ineI"
+                            ),
+                            0x0000_0001 => {
+                                let features_ecx = (1 << 0)   // SSE3
+                                    | (1 << 9)                 // SSSE3
+                                    | (1 << 13)                // CMPXCHG16B
+                                    | (1 << 19)                // SSE4.1
+                                    | (1 << 20)                // SSE4.2
+                                    | (1 << 23); // POPCNT
+                                let features_edx = (1 << 0) // FPU
+                                    | (1 << 4)               // TSC
+                                    | (1 << 15)              // CMOV
+                                    | (1 << 23)              // MMX
+                                    | (1 << 24)              // FXSR
+                                    | (1 << 25)              // SSE
+                                    | (1 << 26); // SSE2
+                                (0x0000_0663, 0, features_ecx, features_edx)
+                            }
+                            0x0000_0007 => {
+                                let _ = subleaf;
+                                (0, 0, 0, 0)
+                            }
+                            0x8000_0000 => (0x8000_0001, 0, 0, 0),
+                            0x8000_0001 => (0, 0, 0, 0),
+                            _ => (0, 0, 0, 0),
+                        };
+                        self.eax = eax;
+                        self.ebx = ebx;
+                        self.ecx = ecx;
+                        self.edx = edx;
+                        self.eip = s.ip;
+                        return Ok(());
+                    }
+                    0xA3 => {
+                        // BT r/m16|32, r16|32
+                        // 语义：把选中位复制到 CF，其它标志不定义（这里保持不变）。
+                        let modrm = s.fetch_modrm()?;
+                        let bit_src = self.reg32(modrm.reg);
+
+                        let bit = if modrm.mod_ == 0b11 {
+                            if is_16bit {
+                                let value = self.reg32(modrm.rm) & 0xFFFF;
+                                (value >> (bit_src & 0x0F)) & 1
+                            } else {
+                                let value = self.reg32(modrm.rm);
+                                (value >> (bit_src & 0x1F)) & 1
+                            }
+                        } else {
+                            let base = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            if is_16bit {
+                                let bit_index = bit_src as i32;
+                                let word_disp = (bit_index >> 4) * 2;
+                                let addr = base.wrapping_add(word_disp as u32);
+                                let value = self.read_u16(mem, addr)? as u32;
+                                (value >> ((bit_index as u32) & 0x0F)) & 1
+                            } else {
+                                let bit_index = bit_src as i32;
+                                let dword_disp = (bit_index >> 5) * 4;
+                                let addr = base.wrapping_add(dword_disp as u32);
+                                let value = self.read_u32(mem, addr)?;
+                                (value >> ((bit_index as u32) & 0x1F)) & 1
+                            }
+                        };
+
+                        Flags::set(&mut self.eflags, Flags::CF, bit != 0);
+                        self.eip = s.ip;
+                        return Ok(());
+                    }
+                    0x40..=0x4F => {
+                        // CMOVcc r16|32, r/m16|32
+                        let cc = op2 & 0x0F;
+                        let modrm = s.fetch_modrm()?;
+                        let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                        self.eip = s.ip;
+                        if self.condition_true(cc) {
+                            if is_16bit {
+                                let value16 = match src {
+                                    crate::decode::Operand32::Mem(addr) => self.read_u16(mem, addr)? as u32,
+                                    crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                                };
+                                let old = self.reg32(modrm.reg);
+                                self.set_reg32(modrm.reg, (old & 0xFFFF_0000) | value16);
+                            } else {
+                                let value = self.read_operand32(mem, src)?;
+                                self.set_reg32(modrm.reg, value);
+                            }
+                        }
                         return Ok(());
                     }
                     0x80..=0x8F => {
@@ -688,7 +1645,395 @@ impl Cpu {
                             s.ip = s.ip.wrapping_add(rel);
                         }
                     }
-                    0xAF => { // IMUL r32, r/m32 (进阶乘法，编译器优化常客)
+                    0x90..=0x9F => {
+                        // SETcc r/m8
+                        let cc = op2 & 0x0F;
+                        let modrm = s.fetch_modrm()?;
+                        let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                        let value = if self.condition_true(cc) { 1 } else { 0 };
+                        self.eip = s.ip;
+                        self.write_operand8(mem, dst, value)?;
+                        return Ok(());
+                    }
+                    0x10 => {
+                        // MOVUPS/MOVUPD/MOVAPS/MOVAPD 或 MOVSS/MOVSD（按前缀区分）
+                        let modrm = s.fetch_modrm()?;
+                        self.eip = s.ip;
+                        if prefix_f2 {
+                            // MOVSD xmm, xmm/m64: 只覆盖低 64 位
+                            let mut dst = self.xmm_reg(modrm.reg);
+                            if modrm.mod_ == 0b11 {
+                                let src = self.xmm_reg(modrm.rm);
+                                dst[..8].copy_from_slice(&src[..8]);
+                            } else {
+                                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                                self.eip = s.ip;
+                                let mut low = [0u8; 8];
+                                mem.read(addr, &mut low)?;
+                                dst[..8].copy_from_slice(&low);
+                            }
+                            self.set_xmm_reg(modrm.reg, dst);
+                            return Ok(());
+                        }
+                        if prefix_f3 {
+                            // MOVSS xmm, xmm/m32: 只覆盖低 32 位
+                            let mut dst = self.xmm_reg(modrm.reg);
+                            if modrm.mod_ == 0b11 {
+                                let src = self.xmm_reg(modrm.rm);
+                                dst[..4].copy_from_slice(&src[..4]);
+                            } else {
+                                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                                self.eip = s.ip;
+                                let mut low = [0u8; 4];
+                                mem.read(addr, &mut low)?;
+                                dst[..4].copy_from_slice(&low);
+                            }
+                            self.set_xmm_reg(modrm.reg, dst);
+                            return Ok(());
+                        }
+
+                        let src = if modrm.mod_ == 0b11 {
+                            self.xmm_reg(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            let mut buf = [0u8; 16];
+                            mem.read(addr, &mut buf)?;
+                            buf
+                        };
+                        self.set_xmm_reg(modrm.reg, src);
+                        return Ok(());
+                    }
+                    0x11 => {
+                        // MOVUPS/MOVUPD/MOVAPS/MOVAPD 或 MOVSS/MOVSD（按前缀区分）
+                        let modrm = s.fetch_modrm()?;
+                        let src = self.xmm_reg(modrm.reg);
+                        self.eip = s.ip;
+                        if prefix_f2 {
+                            // MOVSD xmm/m64, xmm: 只写低 64 位
+                            if modrm.mod_ == 0b11 {
+                                let mut dst = self.xmm_reg(modrm.rm);
+                                dst[..8].copy_from_slice(&src[..8]);
+                                self.set_xmm_reg(modrm.rm, dst);
+                            } else {
+                                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                                self.eip = s.ip;
+                                mem.write(addr, &src[..8])?;
+                            }
+                            return Ok(());
+                        }
+                        if prefix_f3 {
+                            // MOVSS xmm/m32, xmm: 只写低 32 位
+                            if modrm.mod_ == 0b11 {
+                                let mut dst = self.xmm_reg(modrm.rm);
+                                dst[..4].copy_from_slice(&src[..4]);
+                                self.set_xmm_reg(modrm.rm, dst);
+                            } else {
+                                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                                self.eip = s.ip;
+                                mem.write(addr, &src[..4])?;
+                            }
+                            return Ok(());
+                        }
+
+                        if modrm.mod_ == 0b11 {
+                            self.set_xmm_reg(modrm.rm, src);
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            mem.write(addr, &src)?;
+                        }
+                        return Ok(());
+                    }
+                    0x28 => {
+                        // MOVAPS/MOVAPD
+                        let modrm = s.fetch_modrm()?;
+                        let src = if modrm.mod_ == 0b11 {
+                            self.xmm_reg(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            let mut buf = [0u8; 16];
+                            mem.read(addr, &mut buf)?;
+                            buf
+                        };
+                        self.eip = s.ip;
+                        self.set_xmm_reg(modrm.reg, src);
+                        return Ok(());
+                    }
+                    0x29 => {
+                        // MOVAPS/MOVAPD
+                        let modrm = s.fetch_modrm()?;
+                        let src = self.xmm_reg(modrm.reg);
+                        if modrm.mod_ == 0b11 {
+                            self.eip = s.ip;
+                            self.set_xmm_reg(modrm.rm, src);
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            mem.write(addr, &src)?;
+                        }
+                        return Ok(());
+                    }
+                    0x2C => {
+                        // CVTTSS2SI / CVTTSD2SI（按 F3/F2 前缀区分），仅实现 32 位目标寄存器。
+                        let modrm = s.fetch_modrm()?;
+                        let value = if prefix_f3 {
+                            if modrm.mod_ == 0b11 {
+                                let src = self.xmm_reg(modrm.rm);
+                                let mut raw = [0u8; 4];
+                                raw.copy_from_slice(&src[..4]);
+                                f32::from_le_bytes(raw) as f64
+                            } else {
+                                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                                self.eip = s.ip;
+                                let mut raw = [0u8; 4];
+                                mem.read(addr, &mut raw)?;
+                                f32::from_le_bytes(raw) as f64
+                            }
+                        } else if prefix_f2 {
+                            if modrm.mod_ == 0b11 {
+                                let src = self.xmm_reg(modrm.rm);
+                                let mut raw = [0u8; 8];
+                                raw.copy_from_slice(&src[..8]);
+                                f64::from_le_bytes(raw)
+                            } else {
+                                let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                                self.eip = s.ip;
+                                let mut raw = [0u8; 8];
+                                mem.read(addr, &mut raw)?;
+                                f64::from_le_bytes(raw)
+                            }
+                        } else {
+                            return Err(ExecError::UnimplementedOpcode(op2, start));
+                        };
+
+                        // x86 约定：NaN/溢出时返回 0x80000000。
+                        let out = if !value.is_finite()
+                            || value >= 2_147_483_648.0
+                            || value < -2_147_483_648.0
+                        {
+                            0x8000_0000u32
+                        } else {
+                            (value.trunc() as i32) as u32
+                        };
+                        self.eip = s.ip;
+                        self.set_reg32(modrm.reg, out);
+                        return Ok(());
+                    }
+                    0x57 => {
+                        // XORPS/XORPD（按位异或，前缀不影响按位语义）
+                        let modrm = s.fetch_modrm()?;
+                        let lhs = self.xmm_reg(modrm.reg);
+                        let rhs = if modrm.mod_ == 0b11 {
+                            self.xmm_reg(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            let mut buf = [0u8; 16];
+                            mem.read(addr, &mut buf)?;
+                            buf
+                        };
+                        let mut out = [0u8; 16];
+                        for i in 0..16 {
+                            out[i] = lhs[i] ^ rhs[i];
+                        }
+                        self.eip = s.ip;
+                        self.set_xmm_reg(modrm.reg, out);
+                        return Ok(());
+                    }
+                    0x5C => {
+                        // SUBPS/SUBPD
+                        let modrm = s.fetch_modrm()?;
+                        let mut dst = self.xmm_reg(modrm.reg);
+                        let src = if modrm.mod_ == 0b11 {
+                            self.xmm_reg(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            let mut buf = [0u8; 16];
+                            mem.read(addr, &mut buf)?;
+                            buf
+                        };
+                        self.eip = s.ip;
+                        if prefix_66 {
+                            for lane in 0..2 {
+                                let off = lane * 8;
+                                let mut a = [0u8; 8];
+                                let mut b = [0u8; 8];
+                                a.copy_from_slice(&dst[off..off + 8]);
+                                b.copy_from_slice(&src[off..off + 8]);
+                                let r = f64::from_le_bytes(a) - f64::from_le_bytes(b);
+                                dst[off..off + 8].copy_from_slice(&r.to_le_bytes());
+                            }
+                        } else {
+                            for lane in 0..4 {
+                                let off = lane * 4;
+                                let mut a = [0u8; 4];
+                                let mut b = [0u8; 4];
+                                a.copy_from_slice(&dst[off..off + 4]);
+                                b.copy_from_slice(&src[off..off + 4]);
+                                let r = f32::from_le_bytes(a) - f32::from_le_bytes(b);
+                                dst[off..off + 4].copy_from_slice(&r.to_le_bytes());
+                            }
+                        }
+                        self.set_xmm_reg(modrm.reg, dst);
+                        return Ok(());
+                    }
+                    0x5E => {
+                        // DIVPS/DIVPD/DIVSD（按前缀区分）
+                        let modrm = s.fetch_modrm()?;
+                        let mut dst = self.xmm_reg(modrm.reg);
+                        let src = if modrm.mod_ == 0b11 {
+                            self.xmm_reg(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            let mut buf = [0u8; 16];
+                            mem.read(addr, &mut buf)?;
+                            buf
+                        };
+                        self.eip = s.ip;
+
+                        if prefix_f2 {
+                            let mut a = [0u8; 8];
+                            let mut b = [0u8; 8];
+                            a.copy_from_slice(&dst[..8]);
+                            b.copy_from_slice(&src[..8]);
+                            let r = f64::from_le_bytes(a) / f64::from_le_bytes(b);
+                            dst[..8].copy_from_slice(&r.to_le_bytes());
+                        } else if prefix_66 {
+                            for lane in 0..2 {
+                                let off = lane * 8;
+                                let mut a = [0u8; 8];
+                                let mut b = [0u8; 8];
+                                a.copy_from_slice(&dst[off..off + 8]);
+                                b.copy_from_slice(&src[off..off + 8]);
+                                let r = f64::from_le_bytes(a) / f64::from_le_bytes(b);
+                                dst[off..off + 8].copy_from_slice(&r.to_le_bytes());
+                            }
+                        } else {
+                            for lane in 0..4 {
+                                let off = lane * 4;
+                                let mut a = [0u8; 4];
+                                let mut b = [0u8; 4];
+                                a.copy_from_slice(&dst[off..off + 4]);
+                                b.copy_from_slice(&src[off..off + 4]);
+                                let r = f32::from_le_bytes(a) / f32::from_le_bytes(b);
+                                dst[off..off + 4].copy_from_slice(&r.to_le_bytes());
+                            }
+                        }
+                        self.set_xmm_reg(modrm.reg, dst);
+                        return Ok(());
+                    }
+                    0x62 => {
+                        // PUNPCKLDQ xmm, xmm/m128
+                        let modrm = s.fetch_modrm()?;
+                        let dst = self.xmm_reg(modrm.reg);
+                        let src = if modrm.mod_ == 0b11 {
+                            self.xmm_reg(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            let mut buf = [0u8; 16];
+                            mem.read(addr, &mut buf)?;
+                            buf
+                        };
+                        self.eip = s.ip;
+                        let mut out = [0u8; 16];
+                        out[0..4].copy_from_slice(&dst[0..4]);
+                        out[4..8].copy_from_slice(&src[0..4]);
+                        out[8..12].copy_from_slice(&dst[4..8]);
+                        out[12..16].copy_from_slice(&src[4..8]);
+                        self.set_xmm_reg(modrm.reg, out);
+                        return Ok(());
+                    }
+                    0x6E => {
+                        // MOVD xmm, r/m32（66 0F 6E）
+                        let modrm = s.fetch_modrm()?;
+                        let src32 = if modrm.mod_ == 0b11 {
+                            self.reg32(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            self.read_u32(mem, addr)?
+                        };
+                        self.eip = s.ip;
+                        let mut out = [0u8; 16];
+                        out[..4].copy_from_slice(&src32.to_le_bytes());
+                        self.set_xmm_reg(modrm.reg, out);
+                        return Ok(());
+                    }
+                    0x7C => {
+                        // HADDPD/HADDPS（按前缀区分）
+                        let modrm = s.fetch_modrm()?;
+                        let mut dst = self.xmm_reg(modrm.reg);
+                        let src = if modrm.mod_ == 0b11 {
+                            self.xmm_reg(modrm.rm)
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            let mut buf = [0u8; 16];
+                            mem.read(addr, &mut buf)?;
+                            buf
+                        };
+                        self.eip = s.ip;
+                        if prefix_66 {
+                            let mut d0 = [0u8; 8];
+                            let mut d1 = [0u8; 8];
+                            let mut s0 = [0u8; 8];
+                            let mut s1 = [0u8; 8];
+                            d0.copy_from_slice(&dst[0..8]);
+                            d1.copy_from_slice(&dst[8..16]);
+                            s0.copy_from_slice(&src[0..8]);
+                            s1.copy_from_slice(&src[8..16]);
+                            let r0 = f64::from_le_bytes(d0) + f64::from_le_bytes(d1);
+                            let r1 = f64::from_le_bytes(s0) + f64::from_le_bytes(s1);
+                            dst[0..8].copy_from_slice(&r0.to_le_bytes());
+                            dst[8..16].copy_from_slice(&r1.to_le_bytes());
+                        } else {
+                            let mut out = [0u8; 16];
+                            let f = |buf: &[u8]| {
+                                let mut a = [0u8; 4];
+                                a.copy_from_slice(buf);
+                                f32::from_le_bytes(a)
+                            };
+                            let d0 = f(&dst[0..4]);
+                            let d1 = f(&dst[4..8]);
+                            let d2 = f(&dst[8..12]);
+                            let d3 = f(&dst[12..16]);
+                            let s0 = f(&src[0..4]);
+                            let s1 = f(&src[4..8]);
+                            let s2 = f(&src[8..12]);
+                            let s3 = f(&src[12..16]);
+                            out[0..4].copy_from_slice(&(d0 + d1).to_le_bytes());
+                            out[4..8].copy_from_slice(&(d2 + d3).to_le_bytes());
+                            out[8..12].copy_from_slice(&(s0 + s1).to_le_bytes());
+                            out[12..16].copy_from_slice(&(s2 + s3).to_le_bytes());
+                            dst = out;
+                        }
+                        self.set_xmm_reg(modrm.reg, dst);
+                        return Ok(());
+                    }
+                    0x7E => {
+                        // MOVD r/m32, xmm（66 0F 7E）
+                        let modrm = s.fetch_modrm()?;
+                        let src = self.xmm_reg(modrm.reg);
+                        let mut low = [0u8; 4];
+                        low.copy_from_slice(&src[..4]);
+                        let value = u32::from_le_bytes(low);
+                        self.eip = s.ip;
+                        if modrm.mod_ == 0b11 {
+                            self.set_reg32(modrm.rm, value);
+                        } else {
+                            let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
+                            self.eip = s.ip;
+                            self.write_u32(mem, addr, value)?;
+                        }
+                        return Ok(());
+                    }
+                    0xAF => {
+                        // IMUL r32, r/m32 (进阶乘法，编译器优化常客)
                         let modrm = s.fetch_modrm()?;
                         let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
                         let lhs = self.reg32(modrm.reg);
@@ -698,14 +2043,73 @@ impl Cpu {
                         self.eip = s.ip;
                         return Ok(());
                     }
-                    0xB6 => { // MOVZX r32, r/m8
+                    0xB0 => {
+                        // CMPXCHG r/m8, r8
+                        let modrm = s.fetch_modrm()?;
+                        let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                        let dst_val = self.read_operand8(mem, dst)?;
+                        let src_val = self.reg8(modrm.reg);
+                        let acc = self.reg8(0); // AL
+                        let _ = self.alu_sub32(dst_val as u32, acc as u32);
+                        self.eip = s.ip;
+                        if dst_val == acc {
+                            self.write_operand8(mem, dst, src_val)?;
+                        } else {
+                            self.set_reg8(0, dst_val);
+                        }
+                        return Ok(());
+                    }
+                    0xB1 => {
+                        // CMPXCHG r/m16|32, r16|32
+                        let modrm = s.fetch_modrm()?;
+                        let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
+                        self.eip = s.ip;
+                        if is_16bit {
+                            let dst_val = match dst {
+                                crate::decode::Operand32::Mem(addr) => self.read_u16(mem, addr)? as u32,
+                                crate::decode::Operand32::Reg(r) => self.reg32(r) & 0xFFFF,
+                            };
+                            let src_val = self.reg32(modrm.reg) & 0xFFFF;
+                            let acc = self.eax & 0xFFFF;
+                            let _ = self.alu_sub32(dst_val, acc);
+                            if dst_val == acc {
+                                match dst {
+                                    crate::decode::Operand32::Mem(addr) => {
+                                        mem.write(addr, &(src_val as u16).to_le_bytes())?
+                                    }
+                                    crate::decode::Operand32::Reg(r) => {
+                                        let old = self.reg32(r);
+                                        self.set_reg32(r, (old & 0xFFFF_0000) | src_val);
+                                    }
+                                }
+                            } else {
+                                self.eax = (self.eax & 0xFFFF_0000) | dst_val;
+                            }
+                        } else {
+                            let dst_val = self.read_operand32(mem, dst)?;
+                            let src_val = self.reg32(modrm.reg);
+                            let acc = self.eax;
+                            let _ = self.alu_sub32(dst_val, acc);
+                            if dst_val == acc {
+                                self.write_operand32(mem, dst, src_val)?;
+                            } else {
+                                self.eax = dst_val;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    0xB6 => {
+                        // MOVZX r32, r/m8
                         let modrm = s.fetch_modrm()?;
                         let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
                         let byte = match src {
                             crate::decode::Operand32::Reg(r) => {
                                 let base = r % 4;
-                                if r < 4 { (self.reg32(base) & 0xFF) as u8 }
-                                else { ((self.reg32(base) >> 8) & 0xFF) as u8 }
+                                if r < 4 {
+                                    (self.reg32(base) & 0xFF) as u8
+                                } else {
+                                    ((self.reg32(base) >> 8) & 0xFF) as u8
+                                }
                             }
                             crate::decode::Operand32::Mem(addr) => self.read_u8(mem, addr)?,
                         };
@@ -713,7 +2117,8 @@ impl Cpu {
                         self.set_reg32(modrm.reg, byte as u32);
                         return Ok(());
                     }
-                    0xB7 => { // MOVZX r32, r/m16
+                    0xB7 => {
+                        // MOVZX r32, r/m16
                         let modrm = s.fetch_modrm()?;
                         let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
                         let word = match src {
@@ -724,14 +2129,18 @@ impl Cpu {
                         self.set_reg32(modrm.reg, word as u32);
                         return Ok(());
                     }
-                    0xBE => { // MOVSX r32, r/m8
+                    0xBE => {
+                        // MOVSX r32, r/m8
                         let modrm = s.fetch_modrm()?;
                         let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
                         let byte = match src {
                             crate::decode::Operand32::Reg(r) => {
                                 let base = r % 4;
-                                if r < 4 { (self.reg32(base) & 0xFF) as u8 }
-                                else { ((self.reg32(base) >> 8) & 0xFF) as u8 }
+                                if r < 4 {
+                                    (self.reg32(base) & 0xFF) as u8
+                                } else {
+                                    ((self.reg32(base) >> 8) & 0xFF) as u8
+                                }
                             }
                             crate::decode::Operand32::Mem(addr) => self.read_u8(mem, addr)?,
                         };
@@ -740,7 +2149,8 @@ impl Cpu {
                         self.set_reg32(modrm.reg, (byte as i8) as i32 as u32);
                         return Ok(());
                     }
-                    0xBF => { // MOVSX r32, r/m16
+                    0xBF => {
+                        // MOVSX r32, r/m16
                         let modrm = s.fetch_modrm()?;
                         let src = self.decode_rm32_operand(mem, &mut s, modrm)?;
                         let word = match src {
@@ -762,6 +2172,14 @@ impl Cpu {
                 }
                 return Err(ExecError::UnimplementedOpcode(opcode, start));
             }
+            0xCE => {
+                // INTO: only triggers when OF=1; otherwise behaves like NOP.
+                if Flags::get(self.eflags, Flags::OF) {
+                    return Err(ExecError::InvalidInstruction(start, "into overflow trap"));
+                }
+                self.eip = s.ip;
+                return Ok(());
+            }
 
             _ => return Err(ExecError::UnimplementedOpcode(opcode, start)),
         }
@@ -772,7 +2190,6 @@ impl Cpu {
 
     pub fn run(&mut self, mem: &mut GuestMemory, max_instructions: usize) -> Result<(), ExecError> {
         for _ in 0..max_instructions {
-
             self.step(mem)?;
         }
         Ok(())

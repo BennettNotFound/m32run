@@ -94,19 +94,13 @@ pub fn prepare_stack(
     if trace {
         eprintln!(
             "[ABI] STACK_TOP={:#010x} STACK_SIZE={:#010x} STACK_INITIAL_SLACK={:#010x}",
-            STACK_TOP,
-            STACK_SIZE,
-            STACK_INITIAL_SLACK
+            STACK_TOP, STACK_SIZE, STACK_INITIAL_SLACK
         );
     }
     // ------------------------------------------------------------
     // 1. 映射整块栈区域
     // ------------------------------------------------------------
-    mem.map(
-        STACK_TOP - STACK_SIZE,
-        STACK_SIZE,
-        Prot::READ | Prot::WRITE,
-    )?;
+    mem.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::READ | Prot::WRITE)?;
 
     // 初始栈顶不直接贴着 STACK_TOP，给顶部留一段缓冲
     let mut sp = STACK_TOP - STACK_INITIAL_SLACK;
@@ -121,9 +115,7 @@ pub fn prepare_stack(
     argv_strings.extend(args.iter().cloned());
 
     // apple 向量先保留最小必要项
-    let apple_strings = vec![
-        format!("executable_path={}", exec_path),
-    ];
+    let apple_strings = vec![format!("executable_path={}", exec_path)];
 
     // ------------------------------------------------------------
     // 3. 先把所有字符串写到高地址区域

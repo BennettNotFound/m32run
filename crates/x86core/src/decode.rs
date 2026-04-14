@@ -29,7 +29,11 @@ pub struct InstructionStream<'a> {
 
 impl<'a> InstructionStream<'a> {
     pub fn new(mem: &'a GuestMemory, ip: u32) -> Self {
-        Self { mem, ip, start_eip: ip }
+        Self {
+            mem,
+            ip,
+            start_eip: ip,
+        }
     }
 
     pub fn fetch_u8(&mut self) -> Result<u8, ExecError> {

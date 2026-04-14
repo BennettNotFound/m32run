@@ -81,7 +81,9 @@ pub struct GuestMemory {
 impl GuestMemory {
     /// Creates a new empty guest memory.
     pub fn new() -> Self {
-        Self { regions: Vec::new() }
+        Self {
+            regions: Vec::new(),
+        }
     }
 
     /// Maps a new region at the given virtual address with the given

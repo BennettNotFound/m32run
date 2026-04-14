@@ -27,6 +27,8 @@ impl Flags {
     pub fn set_zf_sf(eflags: &mut u32, result: u32) {
         Self::set(eflags, Self::ZF, result == 0);
         Self::set(eflags, Self::SF, (result & 0x8000_0000) != 0);
+        let low = (result & 0xFF) as u8;
+        Self::set(eflags, Self::PF, low.count_ones() % 2 == 0);
     }
 
     pub fn set_logic(eflags: &mut u32, result: u32) {
