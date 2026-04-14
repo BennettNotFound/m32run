@@ -1,0 +1,11 @@
+[package]
+name = "loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macho32 = { path = "../macho32" }
+guestmem = { path = "../guestmem" }
+x86core = { path = "../x86core" }
+abi = { path = "../abi" }
+thiserror = "1"

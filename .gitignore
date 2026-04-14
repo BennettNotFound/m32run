@@ -1,0 +1,25 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE/editor metadata
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Rust/Cargo build artifacts
+/target/
+
+# Logs and temp files
+*.log
+*.tmp
+tmp/
+
+# Keep Cargo.lock for application/workspace reproducible builds.
+# Uncomment the next line only if you explicitly want to ignore it.
+# Cargo.lock

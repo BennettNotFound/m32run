@@ -1,0 +1,10 @@
+[package]
+name = "m32run"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+loader = { path = "../loader" }
+x86core = { path = "../x86core" }
+shim = { path = "../shim" } # 新增这一行
+thiserror = "1"

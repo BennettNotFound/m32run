@@ -1,0 +1,8 @@
+[package]
+name = "x86core"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+guestmem = { path = "../guestmem" }
+thiserror = "1"

@@ -1,0 +1,22 @@
+## Workspace definition for the m32run project
+##
+## This workspace groups together several crates that collectively
+## implement a minimal proof‑of‑concept for running 32‑bit x86 Mach‑O
+## binaries on modern macOS machines.  The code here is intentionally
+## modest in scope: it does not attempt to emulate every nuance of
+## the old Darwin environment, but instead provides a clear starting
+## point and reference structure for further exploration.
+##
+[workspace]
+members = [
+    "crates/macho32",
+    "crates/guestmem",
+    "crates/x86core",
+    "crates/abi",
+    "crates/loader",
+    "crates/shim",
+    "crates/host",
+    "crates/m32run",
+]
+
+resolver = "2"

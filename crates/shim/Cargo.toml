@@ -1,0 +1,8 @@
+[package]
+name = "shim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+guestmem = { path = "../guestmem" }
+x86core = { path = "../x86core" }
