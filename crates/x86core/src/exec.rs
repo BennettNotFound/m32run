@@ -20,16 +20,22 @@ pub enum ExecError {
 
     #[error("syscall requested")]
     Syscall,
+
+    #[error(
+        "unresolved import stub at {eip:#010x} (stub_index={stub_index}, indirect_symbol_index={indirect_symbol_index})"
+    )]
+    UnresolvedImportStub {
+        eip: u32,
+        stub_index: u32,
+        indirect_symbol_index: u32,
+    },
 }
 
 impl Cpu {
     pub fn step(&mut self, mem: &mut GuestMemory) -> Result<(), ExecError> {
         if self.trace {
             // 打印关键寄存器状态
-            println!(
-                "TRACE: EIP={:#010x} | EAX={:#010x} EBX={:#010x} ECX={:#010x} EDX={:#010x} | ESP={:#010x} EBP={:#010x}",
-                self.eip, self.eax, self.ebx, self.ecx, self.edx, self.esp, self.ebp
-            );
+            self.trace_state(mem);
         }
         let start = self.eip;
         let mut s = InstructionStream::new(mem, self.eip);
@@ -60,7 +66,18 @@ impl Cpu {
             0x90 => {
                 // 原本的 0x90 NOP，直接放行
             }
-            0xF4 => return Err(ExecError::Halt),
+            0xF4 => {
+                if let Some(stub_index) = self.import_stub_index(start) {
+                    let indirect_symbol_index = self.import_jump_table_reserved1 + stub_index;
+                    return Err(ExecError::UnresolvedImportStub {
+                        eip: start,
+                        stub_index,
+                        indirect_symbol_index,
+                    });
+                } else {
+                    return Err(ExecError::Halt);
+                }
+            }
 
             0x68 => {
                 // 致命修复：16位模式下 push 的是 2 字节立即数
@@ -755,6 +772,7 @@ impl Cpu {
 
     pub fn run(&mut self, mem: &mut GuestMemory, max_instructions: usize) -> Result<(), ExecError> {
         for _ in 0..max_instructions {
+
             self.step(mem)?;
         }
         Ok(())

@@ -15,6 +15,11 @@ pub struct Cpu {
     pub esp: u32,
     pub eip: u32,
     pub eflags: u32,
+    // __IMPORT.__jump_table 元数据
+    pub import_jump_table_addr: u32,
+    pub import_jump_table_size: u32,
+    pub import_jump_table_stub_size: u32,
+    pub import_jump_table_reserved1: u32,
     pub trace: bool, // 新增：是否开启追踪
 }
 
@@ -37,8 +42,80 @@ impl Cpu {
             esp: 0,
             eip: 0,
             eflags: 0,
+            import_jump_table_addr: 0,
+            import_jump_table_size: 0,
+            import_jump_table_stub_size: 0,
+            import_jump_table_reserved1: 0,
             trace: false, // 默认关闭
         }
+    }
+
+    pub fn trace_state(&self, mem: &GuestMemory) {
+        if !self.trace {
+            return;
+        }
+
+        let mut bytes = Vec::new();
+        for i in 0..8u32 {
+            match self.read_u8(mem, self.eip.wrapping_add(i)) {
+                Ok(b) => bytes.push(format!("{:02x}", b)),
+                Err(_) => {
+                    bytes.push("??".to_string());
+                    break;
+                }
+            }
+        }
+
+        eprintln!(
+            "TRACE: EIP={:#010x} BYTES=[{}] | EAX={:#010x} EBX={:#010x} ECX={:#010x} EDX={:#010x} | ESP={:#010x} EBP={:#010x}",
+            self.eip,
+            bytes.join(" "),
+            self.eax,
+            self.ebx,
+            self.ecx,
+            self.edx,
+            self.esp,
+            self.ebp,
+        );
+    }
+    pub fn set_import_jump_table(
+        &mut self,
+        addr: u32,
+        size: u32,
+        stub_size: u32,
+        reserved1: u32,
+    ) {
+        self.import_jump_table_addr = addr;
+        self.import_jump_table_size = size;
+        self.import_jump_table_stub_size = stub_size;
+        self.import_jump_table_reserved1 = reserved1;
+    }
+
+    pub fn import_stub_index(&self, eip: u32) -> Option<u32> {
+        if self.import_jump_table_addr == 0
+            || self.import_jump_table_size == 0
+            || self.import_jump_table_stub_size == 0
+        {
+            return None;
+        }
+
+        let start = self.import_jump_table_addr;
+        let end = start.wrapping_add(self.import_jump_table_size);
+
+        if eip < start || eip >= end {
+            return None;
+        }
+
+        let offset = eip - start;
+        if offset % self.import_jump_table_stub_size != 0 {
+            return None;
+        }
+
+        Some(offset / self.import_jump_table_stub_size)
+    }
+
+    pub fn is_in_import_jump_table(&self, eip: u32) -> bool {
+        self.import_stub_index(eip).is_some()
     }
 
     pub fn reg32(&self, idx: u8) -> u32 {

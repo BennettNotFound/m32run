@@ -39,7 +39,7 @@ fn main() {
     let prog_args: Vec<String> = args_iter.collect();
 
     // 5. 加载并运行
-    match load(&prog_path, &prog_args) {
+    match load(&prog_path, &prog_args, trace_enabled) {
         Ok(mut loaded) => {
             loaded.cpu.trace = trace_enabled; // 设置追踪开关
 
@@ -69,6 +69,19 @@ fn main() {
                     }
                     Err(e) => {
                         println!("\nExecution error: {}", e);
+                        break;
+                    }
+                    Err(ExecError::UnresolvedImportStub {
+                            eip,
+                            stub_index,
+                            indirect_symbol_index,
+                        }) => {
+                        eprintln!(
+                            "\n命中未解析导入跳板: eip={:#010x}, stub_index={}, indirect_symbol_index={}",
+                            eip,
+                            stub_index,
+                            indirect_symbol_index
+                        );
                         break;
                     }
                 }
