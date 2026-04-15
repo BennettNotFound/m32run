@@ -85,7 +85,8 @@ fn read_c_string(mem: &GuestMemory, addr: u32, max_len: usize) -> Result<String,
     let mut out = Vec::new();
     for i in 0..max_len {
         let mut b = [0u8; 1];
-        mem.read(addr.wrapping_add(i as u32), &mut b).map_err(|_| ())?;
+        mem.read(addr.wrapping_add(i as u32), &mut b)
+            .map_err(|_| ())?;
         if b[0] == 0 {
             break;
         }
@@ -411,4 +412,3 @@ pub fn handle_syscall(cpu: &mut Cpu, mem: &mut GuestMemory) -> Result<(), ()> {
         }
     }
 }
-

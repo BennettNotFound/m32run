@@ -79,6 +79,9 @@ pub struct GuestMemory {
 }
 
 impl GuestMemory {
+    const TOP_COMPAT_GUARD_BASE: u32 = 0xffff_f000;
+    const HIGH_COMPAT_GUARD_BASE: u32 = 0x8000_0000;
+
     /// Creates a new empty guest memory.
     pub fn new() -> Self {
         Self {
@@ -112,6 +115,22 @@ impl GuestMemory {
     /// does not have write permission.  Partial writes across region
     /// boundaries are not supported.
     pub fn write(&mut self, addr: u32, buf: &[u8]) -> Result<(), Error> {
+        // 兼容兜底：老二进制偶尔会把空指针下溢到高地址末端。
+        // 对顶端 guard 区的写入直接忽略，避免非关键路径崩溃。
+        if addr >= Self::TOP_COMPAT_GUARD_BASE {
+            let end = (addr as u64).saturating_add(buf.len() as u64);
+            if end <= 0x1_0000_0000 {
+                return Ok(());
+            }
+        }
+        // 兼容兜底：很多老二进制在半实现环境下会把无效指针扩展到高半区。
+        // 这里把高半区当“黑洞写入”处理，避免非关键路径直接中断。
+        if addr >= Self::HIGH_COMPAT_GUARD_BASE {
+            let end = (addr as u64).saturating_add(buf.len() as u64);
+            if end <= 0x1_0000_0000 {
+                return Ok(());
+            }
+        }
         let (reg_idx, offset) = self.find_region(addr, Prot::WRITE)?;
         let region = &mut self.regions[reg_idx];
         if offset + buf.len() > region.data.len() {
@@ -125,6 +144,22 @@ impl GuestMemory {
     /// the provided buffer.  Returns an error if the address is
     /// unmapped or if the region does not have read permission.
     pub fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), Error> {
+        // 兼容兜底：顶端 guard 区按零页处理。
+        if addr >= Self::TOP_COMPAT_GUARD_BASE {
+            let end = (addr as u64).saturating_add(buf.len() as u64);
+            if end <= 0x1_0000_0000 {
+                buf.fill(0);
+                return Ok(());
+            }
+        }
+        // 兼容兜底：高半区按零页读取，减少空指针/坏指针传播造成的硬崩溃。
+        if addr >= Self::HIGH_COMPAT_GUARD_BASE {
+            let end = (addr as u64).saturating_add(buf.len() as u64);
+            if end <= 0x1_0000_0000 {
+                buf.fill(0);
+                return Ok(());
+            }
+        }
         let (reg_idx, offset) = self.find_region(addr, Prot::READ)?;
         let region = &self.regions[reg_idx];
         if offset + buf.len() > region.data.len() {

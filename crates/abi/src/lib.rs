@@ -2,9 +2,8 @@
 //!
 //! 这个模块负责在 guest 内存里构造一个更接近真实 Darwin 进程的初始栈。
 //!
-//! 当前构造出的栈布局如下（注意最前面多了一个 dummy 返回地址）：
+//! 当前构造出的栈布局如下：
 //!
-//!   fake_return_address
 //!   argc
 //!   argv[0]
 //!   argv[1]
@@ -23,7 +22,6 @@
 //! - argv[0] 会被设置为可执行文件路径
 //! - envp 使用外部传入的环境变量
 //! - apple 目前只放最小需要的 `executable_path=...`
-//! - fake_return_address 是为了兼容老式启动代码对 `[ebp+8]` 的访问习惯
 //!
 //! 注意：
 //! - 这仍然不是“完整复刻真实 Darwin 内核创建进程时的全部数据”
@@ -177,22 +175,6 @@ pub fn prepare_stack(
     let argc = argv_ptrs.len() as u32;
     push_u32(mem, &mut sp, argc)?;
 
-    // ------------------------------------------------------------
-    // 8. 压入 fake return address
-    // ------------------------------------------------------------
-    //
-    // 这是这次修复的关键：
-    //
-    // 这样入口如果执行：
-    //   push ebp
-    //   mov  ebp, esp
-    //
-    // 那么：
-    //   [ebp + 8]  -> argc
-    //   [ebp + 12] -> argv[0]
-    //
-    // 否则老式启动代码会把参数区整体错位 4 字节。
-    push_u32(mem, &mut sp, 0)?;
     if trace {
         eprintln!("[ABI] final initial ESP = {:#010x}", sp);
     }

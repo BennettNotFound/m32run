@@ -17,6 +17,7 @@ pub struct Cpu {
     pub eip: u32,
     pub eflags: u32,
     pub tsc: u64,
+    pub instr_counter: u64,
     pub xmm: [[u8; 16]; 8],
     pub fpu_stack: Vec<f64>,
     // __IMPORT.__jump_table 元数据
@@ -26,6 +27,9 @@ pub struct Cpu {
     pub import_jump_table_reserved1: u32,
     // 任意导入 stub 地址 -> indirect symbol index
     pub import_stub_indirect_map: HashMap<u32, u32>,
+    // 端口 I/O：只在 trace 下按 (port,size) 去重打印一次，避免日志刷屏
+    pub traced_io_in_ports: HashMap<(u16, u8), ()>,
+    pub traced_io_out_ports: HashMap<(u16, u8), ()>,
     pub trace: bool, // 新增：是否开启追踪
 }
 
@@ -49,6 +53,7 @@ impl Cpu {
             eip: 0,
             eflags: 0,
             tsc: 0,
+            instr_counter: 0,
             xmm: [[0u8; 16]; 8],
             fpu_stack: Vec::new(),
             import_jump_table_addr: 0,
@@ -56,6 +61,8 @@ impl Cpu {
             import_jump_table_stub_size: 0,
             import_jump_table_reserved1: 0,
             import_stub_indirect_map: HashMap::new(),
+            traced_io_in_ports: HashMap::new(),
+            traced_io_out_ports: HashMap::new(),
             trace: false, // 默认关闭
         }
     }
@@ -242,6 +249,73 @@ impl Cpu {
         Ok(())
     }
 
+    fn trace_io_in_once(&mut self, port: u16, size: u8, value: u32) {
+        if !self.trace {
+            return;
+        }
+        if self.traced_io_in_ports.insert((port, size), ()).is_none() {
+            eprintln!(
+                "[IO] IN  port={:#06x} size={} -> {:#010x}",
+                port, size, value
+            );
+        }
+    }
+
+    fn trace_io_out_once(&mut self, port: u16, size: u8, value: u32) {
+        if !self.trace {
+            return;
+        }
+        if self.traced_io_out_ports.insert((port, size), ()).is_none() {
+            eprintln!(
+                "[IO] OUT port={:#06x} size={} value={:#010x}",
+                port, size, value
+            );
+        }
+    }
+
+    pub fn io_in8(&mut self, port: u16) -> u8 {
+        // 兼容语义：无真实设备时，返回稳定值，避免 guest 直接崩溃。
+        let value = match port {
+            // VGA Input Status Register 1：给出可变化位，避免某些轮询逻辑死等。
+            0x03DA => {
+                if (self.instr_counter & 1) == 0 {
+                    0x08
+                } else {
+                    0x00
+                }
+            }
+            _ => 0,
+        };
+        self.trace_io_in_once(port, 1, value as u32);
+        value
+    }
+
+    pub fn io_in16(&mut self, port: u16) -> u16 {
+        let lo = self.io_in8(port) as u16;
+        let hi = self.io_in8(port.wrapping_add(1)) as u16;
+        (hi << 8) | lo
+    }
+
+    pub fn io_in32(&mut self, port: u16) -> u32 {
+        let b0 = self.io_in8(port) as u32;
+        let b1 = self.io_in8(port.wrapping_add(1)) as u32;
+        let b2 = self.io_in8(port.wrapping_add(2)) as u32;
+        let b3 = self.io_in8(port.wrapping_add(3)) as u32;
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    pub fn io_out8(&mut self, port: u16, value: u8) {
+        self.trace_io_out_once(port, 1, value as u32);
+    }
+
+    pub fn io_out16(&mut self, port: u16, value: u16) {
+        self.trace_io_out_once(port, 2, value as u32);
+    }
+
+    pub fn io_out32(&mut self, port: u16, value: u32) {
+        self.trace_io_out_once(port, 4, value);
+    }
+
     pub fn push32(&mut self, mem: &mut GuestMemory, value: u32) -> Result<(), ExecError> {
         self.esp = self.esp.wrapping_sub(4);
         self.write_u32(mem, self.esp, value)
@@ -389,6 +463,34 @@ impl Cpu {
     pub fn alu_sub32(&mut self, lhs: u32, rhs: u32) -> u32 {
         let result = lhs.wrapping_sub(rhs);
         Flags::set_sub32(&mut self.eflags, lhs, rhs, result);
+        result
+    }
+
+    pub fn alu_sub16(&mut self, lhs: u16, rhs: u16) -> u16 {
+        let result = lhs.wrapping_sub(rhs);
+        let cf = lhs < rhs;
+        let of = (((lhs ^ rhs) & (lhs ^ result)) & 0x8000) != 0;
+        Flags::set(&mut self.eflags, Flags::CF, cf);
+        Flags::set(&mut self.eflags, Flags::OF, of);
+        Flags::set(&mut self.eflags, Flags::ZF, result == 0);
+        Flags::set(&mut self.eflags, Flags::SF, (result & 0x8000) != 0);
+        Flags::set(
+            &mut self.eflags,
+            Flags::PF,
+            (result as u8).count_ones() % 2 == 0,
+        );
+        result
+    }
+
+    pub fn alu_sub8(&mut self, lhs: u8, rhs: u8) -> u8 {
+        let result = lhs.wrapping_sub(rhs);
+        let cf = lhs < rhs;
+        let of = (((lhs ^ rhs) & (lhs ^ result)) & 0x80) != 0;
+        Flags::set(&mut self.eflags, Flags::CF, cf);
+        Flags::set(&mut self.eflags, Flags::OF, of);
+        Flags::set(&mut self.eflags, Flags::ZF, result == 0);
+        Flags::set(&mut self.eflags, Flags::SF, (result & 0x80) != 0);
+        Flags::set(&mut self.eflags, Flags::PF, result.count_ones() % 2 == 0);
         result
     }
 
