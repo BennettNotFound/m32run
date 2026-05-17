@@ -29,6 +29,15 @@
 
 use guestmem::{Error as GuestError, GuestMemory, Prot};
 
+macro_rules! eprintln {
+    () => {
+        runtime_log::stderr_line(String::new())
+    };
+    ($($arg:tt)*) => {
+        runtime_log::stderr_line(format!($($arg)*))
+    };
+}
+
 /// guest 栈的最高地址（不包含）
 ///
 /// 合法栈地址范围大致为：

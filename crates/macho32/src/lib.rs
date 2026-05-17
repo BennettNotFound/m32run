@@ -22,6 +22,7 @@ const FAT_CIGAM_64: u32 = 0xbfba_feca;
 const CPU_TYPE_I386: u32 = 7;
 const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xb;
+const LC_MAIN: u32 = 0x8000_0028;
 const LC_LOAD_DYLIB: u32 = 0xc;
 const LC_LOAD_WEAK_DYLIB: u32 = 0x80000018;
 const LC_REEXPORT_DYLIB: u32 = 0x8000001f;
@@ -275,6 +276,7 @@ fn parse_macho32_at(file: &mut File, base_offset: u64) -> io::Result<MachO32> {
     let mut dylibs = Vec::new();
     let mut offset = 0usize;
     let mut entry_point: Option<u32> = None;
+    let mut main_entryoff: Option<u64> = None;
     let mut import_jump_table: Option<ImportJumpTable32> = None;
     let mut symtab: Option<(u32, u32, u32, u32)> = None;
     let mut dysymtab: Option<(u32, u32)> = None;
@@ -383,6 +385,14 @@ fn parse_macho32_at(file: &mut File, base_offset: u64) -> io::Result<MachO32> {
                     });
                 }
             }
+            LC_MAIN => {
+                // entry_point_command: cmd,cmdsize,entryoff(u64),stacksize(u64)
+                if cmdsize >= 24 {
+                    let lo = read_u32_le(&cmds[offset + 8..offset + 12]) as u64;
+                    let hi = read_u32_le(&cmds[offset + 12..offset + 16]) as u64;
+                    main_entryoff = Some((hi << 32) | lo);
+                }
+            }
             // LC_UNIXTHREAD = 0x5
             0x5 => {
                 // The thread command encodes the entry point for 32‑bit Mach‑O files.
@@ -431,6 +441,20 @@ fn parse_macho32_at(file: &mut File, base_offset: u64) -> io::Result<MachO32> {
             _ => {}
         }
         offset += cmdsize;
+    }
+
+    if entry_point.is_none() {
+        if let Some(entryoff) = main_entryoff {
+            for seg in &segments {
+                let file_start = seg.fileoff as u64;
+                let file_end = file_start.saturating_add(seg.filesize as u64);
+                if entryoff >= file_start && entryoff < file_end {
+                    let delta = entryoff - file_start;
+                    entry_point = Some(seg.vmaddr.wrapping_add(delta as u32));
+                    break;
+                }
+            }
+        }
     }
 
     let mut imports = Vec::new();
@@ -554,7 +578,8 @@ fn parse_macho32_at(file: &mut File, base_offset: u64) -> io::Result<MachO32> {
         }
     }
 
-    // Some old binaries use LC_MAIN (0x80000028) instead of LC_UNIXTHREAD; we don't parse it
+    // Some binaries provide both LC_UNIXTHREAD and LC_MAIN. Prefer LC_UNIXTHREAD when present,
+    // otherwise resolve LC_MAIN entryoff back to virtual address via segment file offsets.
     let entry = entry_point.unwrap_or(0);
     Ok(MachO32 {
         header,

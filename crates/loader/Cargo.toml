@@ -9,3 +9,4 @@ guestmem = { path = "../guestmem" }
 x86core = { path = "../x86core" }
 abi = { path = "../abi" }
 thiserror = "1"
+runtime_log = { path = "../runtime_log" }

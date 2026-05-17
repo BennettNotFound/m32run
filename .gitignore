@@ -19,6 +19,7 @@
 *.log
 *.tmp
 tmp/
+samples/
 
 # Keep Cargo.lock for application/workspace reproducible builds.
 # Uncomment the next line only if you explicitly want to ignore it.

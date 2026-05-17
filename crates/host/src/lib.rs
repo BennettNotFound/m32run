@@ -9,6 +9,8 @@
 
 use std::path::Path;
 
+pub mod graphics;
+
 #[cfg(target_os = "macos")]
 pub fn prepare_macos_ui_app() -> Result<(), String> {
     use cocoa::appkit::NSApp;

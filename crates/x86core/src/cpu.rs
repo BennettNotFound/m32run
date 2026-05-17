@@ -4,6 +4,15 @@ use crate::flags::Flags;
 use guestmem::GuestMemory;
 use std::collections::HashMap;
 
+macro_rules! eprintln {
+    () => {
+        runtime_log::stderr_line(String::new())
+    };
+    ($($arg:tt)*) => {
+        runtime_log::stderr_line(format!($($arg)*))
+    };
+}
+
 #[derive(Debug, Clone)]
 pub struct Cpu {
     pub eax: u32,
@@ -395,7 +404,7 @@ impl Cpu {
         if modrm.mod_ == 0b11 {
             return Err(ExecError::InvalidInstruction(
                 s.ip,
-                "calc_effective_addr called with mod == 11",
+                "calc_effective_addr called with mod == 11".into(),
             ));
         }
 
@@ -570,5 +579,11 @@ impl Cpu {
             0xF => !zf && (sf == of),
             _ => unreachable!(),
         }
+    }
+
+    pub fn return_host_f64(&mut self, value: f64) {
+        // x87 是一个循环栈，ST0 是栈顶
+        // push 一个值到栈顶，相当于把 value 放入 ST0
+        self.fpu_push(value);
     }
 }

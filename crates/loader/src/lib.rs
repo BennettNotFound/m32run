@@ -23,7 +23,7 @@
 //! 所以它能支撑“主程序加载并开始执行”，
 //! 但还不能独立跑复杂动态链接 GUI 程序的全流程。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -38,6 +38,36 @@ use macho32::{parse, ImportKind32, MachO32};
 use thiserror::Error;
 use x86core::Cpu;
 
+macro_rules! println {
+    () => {
+        runtime_log::stdout_line(String::new())
+    };
+    ($($arg:tt)*) => {
+        runtime_log::stdout_line(format!($($arg)*))
+    };
+}
+
+macro_rules! eprintln {
+    () => {
+        runtime_log::stderr_line(String::new())
+    };
+    ($($arg:tt)*) => {
+        runtime_log::stderr_line(format!($($arg)*))
+    };
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => {
+        runtime_log::stdout_fragment(format!($($arg)*))
+    };
+}
+
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        runtime_log::stderr_fragment(format!($($arg)*))
+    };
+}
+
 const ERRNO_ENOENT: u32 = 2;
 const ERRNO_EIO: u32 = 5;
 const ERRNO_EBADF: u32 = 9;
@@ -51,6 +81,13 @@ const ERRNO_EDEADLK: u32 = 35;
 const ERRNO_ERANGE: u32 = 34;
 const ERRNO_ESRCH: u32 = 3;
 const ERRNO_ETIMEDOUT: u32 = 60;
+
+const EVENT_NULL: u16 = 0;
+const EVENT_MOUSE_DOWN: u16 = 1;
+const EVENT_MOUSE_UP: u16 = 2;
+const EVENT_KEY_DOWN: u16 = 3;
+const EVENT_KEY_UP: u16 = 4;
+const EVENT_OS: u16 = 15;
 
 const SECTION_TYPE_MASK: u32 = 0x000000ff;
 const S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
@@ -126,6 +163,28 @@ pub struct GuestThreadSpawnRequest {
     pub start_routine: u32,
     pub arg: u32,
     pub return_stub: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum HostUiEvent {
+    Quit,
+    KeyDown { keycode: i32 },
+    KeyUp { keycode: i32 },
+    MouseMove { x: i32, y: i32 },
+    MouseDown { button: u8, x: i32, y: i32 },
+    MouseUp { button: u8, x: i32, y: i32 },
+    MouseWheel { x: i32, y: i32 },
+    TextInput { text: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GuestEventRecord {
+    what: u16,
+    message: u32,
+    when_ticks: u32,
+    where_v: i16,
+    where_h: i16,
+    modifiers: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,13 +270,17 @@ pub struct DyldState {
     stack_chk_guard_var_ptr: u32,
     dyld_ret0_stub_ptr: u32,
     dyld_pop_ret_stub_ptr: u32,
+    dyld_pop_eax_ret_stub_ptr: u32,
     pthread_thread_return_stub_ptr: u32,
+    pthread_once_continue_stub_ptr: u32,
     current_thread_tid: u32,
     pthread_spawn_queue: Vec<GuestThreadSpawnRequest>,
     pthread_info: HashMap<u32, GuestPthreadInfo>,
     pthread_next_key: u32,
     pthread_next_tid: u32,
     pthread_key_values: HashMap<u32, u32>,
+    pthread_once_done: HashSet<u32>,
+    pthread_once_pending_ret_by_tid: HashMap<u32, Vec<u32>>,
     keymgr_processwide: HashMap<u32, u32>,
     cf_main_bundle_ptr: u32,
     cf_main_info_dict_ptr: u32,
@@ -232,6 +295,7 @@ pub struct DyldState {
     cg_display_height: u32,
     cg_display_bytes_per_row: u32,
     cg_display_bits_per_pixel: u32,
+    graphics_requested: bool,
     cg_palette_enabled: bool,
     cg_palette_entries: [u32; 256],
     qd_display_port_ptr: u32,
@@ -241,6 +305,7 @@ pub struct DyldState {
     qd_pixmap_rowbytes_by_ptr: HashMap<u32, u32>,
     io_notification_port_ptr: u32,
     io_root_port: u32,
+    objc_class_section_ranges: Vec<(u32, u32)>,
     nsapp_var_ptr: u32,
     objc_class_ptr_to_name: HashMap<u32, String>,
     objc_object_ptr_to_class: HashMap<u32, String>,
@@ -252,8 +317,16 @@ pub struct DyldState {
     objc_app_delegate: HashMap<u32, u32>,
     objc_app_main_menu: HashMap<u32, u32>,
     objc_window_title: Option<String>,
-    objc_sdl_launched: bool,
+    objc_run_delegate_dispatched: HashSet<u32>,
     objc_logged_calls: HashSet<String>,
+    ui_events: VecDeque<HostUiEvent>,
+    ui_last_mouse_x: i16,
+    ui_last_mouse_y: i16,
+    ui_mouse_buttons: u16,
+    ui_scrap_text: Vec<u8>,
+    ui_scrap_dirty_from_guest: bool,
+    gnu_istringstream_text: HashMap<u32, Vec<u8>>,
+    gnu_istringstream_cursor: HashMap<u32, usize>,
     warned_unimplemented: HashSet<String>,
 }
 
@@ -282,6 +355,30 @@ impl DyldState {
             out[idx] = (v << 16) | (v << 8) | v;
         }
         out
+    }
+
+    fn collect_objc_class_section_ranges(macho: &MachO32, slide: u32) -> Vec<(u32, u32)> {
+        let mut ranges = Vec::new();
+        for sec in &macho.sections {
+            if sec.segname == "__OBJC" && sec.sectname == "__class" && sec.size >= 40 {
+                let start = sec.addr.wrapping_add(slide);
+                let end = start.wrapping_add(sec.size);
+                ranges.push((start, end));
+            }
+        }
+        ranges
+    }
+
+    fn register_objc_class_sections(&mut self, macho: &MachO32, slide: u32) {
+        for (start, end) in Self::collect_objc_class_section_ranges(macho, slide) {
+            if !self
+                .objc_class_section_ranges
+                .iter()
+                .any(|(s, e)| *s == start && *e == end)
+            {
+                self.objc_class_section_ranges.push((start, end));
+            }
+        }
     }
 
     fn from_macho(macho: &MachO32, trace: bool) -> Self {
@@ -359,13 +456,17 @@ impl DyldState {
             stack_chk_guard_var_ptr: 0,
             dyld_ret0_stub_ptr: 0,
             dyld_pop_ret_stub_ptr: 0,
+            dyld_pop_eax_ret_stub_ptr: 0,
             pthread_thread_return_stub_ptr: 0,
+            pthread_once_continue_stub_ptr: 0,
             current_thread_tid: 1,
             pthread_spawn_queue: Vec::new(),
             pthread_info,
             pthread_next_key: 1,
             pthread_next_tid: 2,
             pthread_key_values: HashMap::new(),
+            pthread_once_done: HashSet::new(),
+            pthread_once_pending_ret_by_tid: HashMap::new(),
             keymgr_processwide: HashMap::new(),
             cf_main_bundle_ptr: 0,
             cf_main_info_dict_ptr: 0,
@@ -380,6 +481,7 @@ impl DyldState {
             cg_display_height: 480,
             cg_display_bytes_per_row: 640,
             cg_display_bits_per_pixel: 8,
+            graphics_requested: false,
             cg_palette_enabled: false,
             cg_palette_entries: Self::default_palette_entries(),
             qd_display_port_ptr: 0,
@@ -389,6 +491,7 @@ impl DyldState {
             qd_pixmap_rowbytes_by_ptr: HashMap::new(),
             io_notification_port_ptr: 0,
             io_root_port: 0,
+            objc_class_section_ranges: Self::collect_objc_class_section_ranges(macho, 0),
             nsapp_var_ptr: 0,
             objc_class_ptr_to_name: HashMap::new(),
             objc_object_ptr_to_class: HashMap::new(),
@@ -400,8 +503,16 @@ impl DyldState {
             objc_app_delegate: HashMap::new(),
             objc_app_main_menu: HashMap::new(),
             objc_window_title: None,
-            objc_sdl_launched: false,
+            objc_run_delegate_dispatched: HashSet::new(),
             objc_logged_calls: HashSet::new(),
+            ui_events: VecDeque::new(),
+            ui_last_mouse_x: 0,
+            ui_last_mouse_y: 0,
+            ui_mouse_buttons: 0,
+            ui_scrap_text: Vec::new(),
+            ui_scrap_dirty_from_guest: false,
+            gnu_istringstream_text: HashMap::new(),
+            gnu_istringstream_cursor: HashMap::new(),
             warned_unimplemented: HashSet::new(),
         }
     }
@@ -409,15 +520,6 @@ impl DyldState {
     fn set_main_executable_path(&mut self, path: &Path) {
         self.main_exec_path = Some(path.to_path_buf());
         self.main_exec_dir = path.parent().map(|p| p.to_path_buf());
-    }
-
-    fn is_dosbox_main(&self) -> bool {
-        self.main_exec_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(|n| n.eq_ignore_ascii_case("DOSBox"))
-            .unwrap_or(false)
     }
 
     fn align_up(value: u32, align: u32) -> u32 {
@@ -651,6 +753,18 @@ impl DyldState {
         Ok(addr)
     }
 
+    fn ensure_dyld_pop_eax_ret_stub(
+        &mut self,
+        mem: &mut GuestMemory,
+    ) -> Result<u32, guestmem::Error> {
+        if self.dyld_pop_eax_ret_stub_ptr != 0 {
+            return Ok(self.dyld_pop_eax_ret_stub_ptr);
+        }
+        let addr = self.alloc_trampoline_code(mem, &[0x58, 0xC3])?; // pop eax; ret
+        self.dyld_pop_eax_ret_stub_ptr = addr;
+        Ok(addr)
+    }
+
     fn ensure_pthread_thread_return_stub(
         &mut self,
         mem: &mut GuestMemory,
@@ -678,6 +792,33 @@ impl DyldState {
         Ok(addr)
     }
 
+    fn ensure_pthread_once_continue_stub(
+        &mut self,
+        mem: &mut GuestMemory,
+        cpu: &mut Cpu,
+    ) -> Result<u32, guestmem::Error> {
+        if self.pthread_once_continue_stub_ptr != 0 {
+            return Ok(self.pthread_once_continue_stub_ptr);
+        }
+        let addr = self.alloc_trampoline_stub(mem)?;
+        let indirect = self.next_dynamic_indirect;
+        self.next_dynamic_indirect = self.next_dynamic_indirect.wrapping_add(1);
+        let binding = ImportBinding {
+            kind: ImportKind32::LazyPointer,
+            addr,
+            size: 4,
+            indirect_symbol_index: indirect,
+            symbol_name: Some("__m32run_pthread_once_continue".to_string()),
+            dylib: Some("m32run".to_string()),
+            section: "__M32RUN.__thread".to_string(),
+        };
+        self.imports_by_addr.insert(addr, binding.clone());
+        self.imports_by_indirect.insert(indirect, binding);
+        cpu.register_import_stub(addr, indirect);
+        self.pthread_once_continue_stub_ptr = addr;
+        Ok(addr)
+    }
+
     fn mark_thread_exited(&mut self, tid: u32, retval: u32) {
         let tid = tid.max(1);
         let entry = self.pthread_info.entry(tid).or_insert(GuestPthreadInfo {
@@ -692,6 +833,7 @@ impl DyldState {
             self.pthread_self_ptr_by_tid.remove(&tid);
             self.errno_slot_by_tid.remove(&tid);
         }
+        self.pthread_once_pending_ret_by_tid.remove(&tid);
     }
 
     fn patch_import_stubs(
@@ -708,13 +850,12 @@ impl DyldState {
             }
             match binding.kind {
                 ImportKind32::SymbolStub => {
-                    let patch_len = binding.size.max(1) as usize;
-                    let patch = vec![0xF4u8; patch_len];
-                    mem.write(binding.addr, &patch)?;
+                    // 在严格 VM 权限下，__TEXT 可能是 RX，不应改写 symbol stub 机器码。
+                    // 只注册 stub 地址即可：CPU 在执行到该 EIP 时会直接走 unresolved-import 路径。
                     cpu.register_import_stub(binding.addr, binding.indirect_symbol_index);
                     if self.trace {
                         eprintln!(
-                            "[DYLD] patched import stub at {:#010x} size={} symbol={} section={}",
+                            "[DYLD] registered import stub at {:#010x} size={} symbol={} section={}",
                             binding.addr,
                             binding.size,
                             binding.display_name(),
@@ -724,6 +865,24 @@ impl DyldState {
                 }
                 ImportKind32::LazyPointer | ImportKind32::NonLazyPointer => {
                     if binding.kind == ImportKind32::NonLazyPointer {
+                        if let Some(symbol_name) = binding.symbol_name.as_deref() {
+                            if let Some(target) =
+                                Self::lookup_export(&self.main_exports, symbol_name)
+                            {
+                                mem.write(binding.addr, &target.to_le_bytes())?;
+                                if self.trace {
+                                    eprintln!(
+                                        "[DYLD] eagerly bound main non-lazy pointer at {:#010x} -> {:#010x} symbol={} section={}",
+                                        binding.addr,
+                                        target,
+                                        binding.display_name(),
+                                        binding.section
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+
                         let symbol = binding.display_name();
                         let symbol_norm = symbol.strip_prefix('_').unwrap_or(symbol.as_str());
                         let var_ptr = match symbol_norm {
@@ -820,13 +979,11 @@ impl DyldState {
         }
         match binding.kind {
             ImportKind32::SymbolStub => {
-                let patch_len = binding.size.max(1) as usize;
-                let patch = vec![0xF4u8; patch_len];
-                mem.write(binding.addr, &patch)?;
+                // 同主镜像导入：动态镜像里的 __TEXT stub 也只注册，不改写。
                 cpu.register_import_stub(binding.addr, binding.indirect_symbol_index);
                 if self.trace {
                     eprintln!(
-                        "[DYLD] patched dynamic import stub at {:#010x} size={} symbol={} section={}",
+                        "[DYLD] registered dynamic import stub at {:#010x} size={} symbol={} section={}",
                         binding.addr,
                         binding.size,
                         binding.display_name(),
@@ -1014,6 +1171,7 @@ impl DyldState {
                 file.read_exact(&mut buf)?;
                 mem.write(load_addr, &buf)?;
             }
+            mem.protect(load_addr, seg.vmsize, runtime_prot)?;
         }
 
         let rebased = self.rebase_dylib_pointers_heuristic(&macho, slide, mem)?;
@@ -1026,6 +1184,7 @@ impl DyldState {
         }
 
         self.register_macho_imports_with_slide(&macho, slide, mem, cpu)?;
+        self.register_objc_class_sections(&macho, slide);
 
         let mut exports = HashMap::new();
         for export in &macho.exports {
@@ -1261,6 +1420,18 @@ impl DyldState {
             .wrapping_add(4)
             .wrapping_add(arg_index.wrapping_mul(4));
         Self::read_u32(mem, addr)
+    }
+
+    fn read_arg_f64(mem: &GuestMemory, cpu: &Cpu, word_index: u32) -> Result<f64, guestmem::Error> {
+        let lo = Self::read_arg_u32(mem, cpu, word_index)? as u64;
+        let hi = Self::read_arg_u32(mem, cpu, word_index + 1)? as u64;
+        Ok(f64::from_bits((hi << 32) | lo))
+    }
+
+    fn return_f64(cpu: &mut Cpu, value: f64) {
+        // 这里必须把 double 写进 x87 ST0，不是写 EAX。
+        // 把下面这行替换成你 x86core::Cpu 里真实的 x87 压栈/写 ST0 方法名。
+        cpu.return_host_f64(value);
     }
 
     fn read_vararg_u32(mem: &GuestMemory, cursor: &mut u32) -> Result<u32, guestmem::Error> {
@@ -1788,6 +1959,30 @@ impl DyldState {
         (secs, usec)
     }
 
+    fn tick_count_60hz() -> u32 {
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        let ticks = dur.as_millis().saturating_mul(60) / 1000;
+        ticks.min(u32::MAX as u128) as u32
+    }
+
+    fn write_event_record(
+        mem: &mut GuestMemory,
+        ptr: u32,
+        rec: GuestEventRecord,
+    ) -> Result<(), guestmem::Error> {
+        if ptr == 0 {
+            return Ok(());
+        }
+        mem.write(ptr, &rec.what.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(2), &rec.message.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(6), &rec.when_ticks.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(10), &rec.where_v.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(12), &rec.where_h.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(14), &rec.modifiers.to_le_bytes())
+    }
+
     fn write_i32(mem: &mut GuestMemory, addr: u32, value: i32) -> Result<(), guestmem::Error> {
         mem.write(addr, &value.to_le_bytes())
     }
@@ -2205,11 +2400,28 @@ impl DyldState {
         if self.cg_display_mode_ptr != 0 {
             return Ok(self.cg_display_mode_ptr);
         }
-        let ptr = self.alloc_heap(mem, 16, true)?;
+
+        let ptr = self.alloc_heap(mem, 64, true)?;
         if ptr == 0 {
             return Err(guestmem::Error::AddressNotMapped(0));
         }
-        mem.write(ptr, &ptr.to_le_bytes())?;
+
+        // 简化版 mode object，前几个字段直接塞常用参数，方便 guest 读取。
+        let width = self.cg_display_width.max(1);
+        let height = self.cg_display_height.max(1);
+        let bpp = self.cg_display_bits_per_pixel.max(8);
+        let bytes_per_pixel = ((bpp + 7) / 8).max(1);
+        let rowbytes = self
+            .cg_display_bytes_per_row
+            .max(width.saturating_mul(bytes_per_pixel));
+
+        mem.write(ptr.wrapping_add(0), &width.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(4), &height.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(8), &bpp.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(12), &rowbytes.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(16), &1u32.to_le_bytes())?; // display id
+        mem.write(ptr.wrapping_add(20), &ptr.to_le_bytes())?; // self / stable marker
+
         self.cg_display_mode_ptr = ptr;
         Ok(ptr)
     }
@@ -2221,11 +2433,18 @@ impl DyldState {
         if self.cg_display_modes_array_ptr != 0 {
             return Ok(self.cg_display_modes_array_ptr);
         }
-        let ptr = self.alloc_heap(mem, 16, true)?;
+
+        let mode_ptr = self.ensure_cg_display_mode_ptr(mem)?;
+        let ptr = self.alloc_heap(mem, 32, true)?;
         if ptr == 0 {
             return Err(guestmem::Error::AddressNotMapped(0));
         }
-        mem.write(ptr, &ptr.to_le_bytes())?;
+
+        // 简化版“数组”：count + first element ptr
+        mem.write(ptr.wrapping_add(0), &1u32.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(4), &mode_ptr.to_le_bytes())?;
+        mem.write(ptr.wrapping_add(8), &mode_ptr.to_le_bytes())?;
+
         self.cg_display_modes_array_ptr = ptr;
         Ok(ptr)
     }
@@ -2247,14 +2466,19 @@ impl DyldState {
         &mut self,
         mem: &mut GuestMemory,
     ) -> Result<GuestFramebufferInfo, guestmem::Error> {
-        let width = self.cg_display_width.max(1);
-        let height = self.cg_display_height.max(1);
+        self.graphics_requested = true;
+
+        let width = self.cg_display_width.max(640);
+        let height = self.cg_display_height.max(480);
         let bits_per_pixel = self.cg_display_bits_per_pixel.max(8);
+
         let bytes_per_pixel = ((bits_per_pixel + 7) / 8).max(1);
         let bytes_per_row = self
             .cg_display_bytes_per_row
             .max(width.saturating_mul(bytes_per_pixel));
+
         let need = bytes_per_row.saturating_mul(height.max(1));
+
         if self.cg_display_base_ptr == 0 {
             let ptr = self.alloc_heap(mem, need.max(64), true)?;
             if ptr == 0 {
@@ -2262,10 +2486,46 @@ impl DyldState {
             }
             self.cg_display_base_ptr = ptr;
         }
+
         self.cg_display_width = width;
         self.cg_display_height = height;
         self.cg_display_bits_per_pixel = bits_per_pixel;
         self.cg_display_bytes_per_row = bytes_per_row;
+
+        // 强制把 QD display port / pixmap 链也同步到这块 buffer
+        if self.qd_display_port_ptr != 0 {
+            let pixmap_ptr = self
+                .qd_port_to_pixmap
+                .get(&self.qd_display_port_ptr)
+                .copied()
+                .unwrap_or(0);
+            if pixmap_ptr != 0 {
+                self.qd_pixmap_base_by_ptr
+                    .insert(pixmap_ptr, self.cg_display_base_ptr);
+                self.qd_pixmap_rowbytes_by_ptr
+                    .insert(pixmap_ptr, self.cg_display_bytes_per_row);
+
+                let _ = mem.write(
+                    pixmap_ptr.wrapping_add(0),
+                    &self.cg_display_base_ptr.to_le_bytes(),
+                );
+                let _ = mem.write(
+                    pixmap_ptr.wrapping_add(4),
+                    &((self.cg_display_bytes_per_row as u16) | 0x8000).to_le_bytes(),
+                );
+
+                let top: i16 = 0;
+                let left: i16 = 0;
+                let bottom: i16 = self.cg_display_height.min(i16::MAX as u32) as i16;
+                let right: i16 = self.cg_display_width.min(i16::MAX as u32) as i16;
+
+                let _ = mem.write(pixmap_ptr.wrapping_add(6), &top.to_le_bytes());
+                let _ = mem.write(pixmap_ptr.wrapping_add(8), &left.to_le_bytes());
+                let _ = mem.write(pixmap_ptr.wrapping_add(10), &bottom.to_le_bytes());
+                let _ = mem.write(pixmap_ptr.wrapping_add(12), &right.to_le_bytes());
+            }
+        }
+
         Ok(GuestFramebufferInfo {
             plane0: self.cg_display_base_ptr,
             width,
@@ -2291,31 +2551,39 @@ impl DyldState {
     }
 
     fn qd_resolve_pixmap_ptr(&self, port_or_pixmap_ptr: u32) -> u32 {
+        if port_or_pixmap_ptr == 0 {
+            return 0;
+        }
         if let Some(&pix) = self.qd_port_to_pixmap.get(&port_or_pixmap_ptr) {
             return pix;
+        }
+        // 已经是 pixmap
+        if self.qd_pixmap_base_by_ptr.contains_key(&port_or_pixmap_ptr) {
+            return port_or_pixmap_ptr;
         }
         port_or_pixmap_ptr
     }
 
-    fn qd_bitmap_base_row(
-        &self,
-        mem: &GuestMemory,
-        port_or_pixmap_ptr: u32,
-    ) -> Option<(u32, u32)> {
+    fn qd_bitmap_base_row(&self, mem: &GuestMemory, port_or_pixmap_ptr: u32) -> Option<(u32, u32)> {
         let pix_ptr = self.qd_resolve_pixmap_ptr(port_or_pixmap_ptr);
         if pix_ptr == 0 {
             return None;
         }
+
         let base = self
             .qd_pixmap_base_by_ptr
             .get(&pix_ptr)
             .copied()
             .unwrap_or_else(|| Self::read_u32(mem, pix_ptr).unwrap_or(0));
+
         let row = self
             .qd_pixmap_rowbytes_by_ptr
             .get(&pix_ptr)
             .copied()
-            .unwrap_or_else(|| (Self::read_u16(mem, pix_ptr.wrapping_add(4)).unwrap_or(0) as u32) & 0x3fff);
+            .unwrap_or_else(|| {
+                (Self::read_u16(mem, pix_ptr.wrapping_add(4)).unwrap_or(0) as u32) & 0x3fff
+            });
+
         if base == 0 || row == 0 {
             None
         } else {
@@ -2325,40 +2593,51 @@ impl DyldState {
 
     fn ensure_qd_display_port(&mut self, mem: &mut GuestMemory) -> Result<u32, guestmem::Error> {
         let fb = self.ensure_cg_display_buffer(mem)?;
+
         if self.qd_display_port_ptr == 0 {
             let port_ptr = self.alloc_heap(mem, 64, true)?;
             let pixmap_ptr = self.alloc_heap(mem, 64, true)?;
             if port_ptr == 0 || pixmap_ptr == 0 {
                 return Err(guestmem::Error::AddressNotMapped(0));
             }
+
             self.qd_display_port_ptr = port_ptr;
             self.qd_current_port_ptr = port_ptr;
             self.qd_port_to_pixmap.insert(port_ptr, pixmap_ptr);
-            let _ = mem.write(port_ptr, &pixmap_ptr.to_le_bytes());
+
+            // port 首字放 pixmap 指针，方便 guest 直接解
+            mem.write(port_ptr.wrapping_add(0), &pixmap_ptr.to_le_bytes())?;
+            mem.write(port_ptr.wrapping_add(4), &0u32.to_le_bytes())?;
         }
+
         let pixmap_ptr = self
             .qd_port_to_pixmap
             .get(&self.qd_display_port_ptr)
             .copied()
             .unwrap_or(0);
+
         if pixmap_ptr != 0 {
             self.qd_pixmap_base_by_ptr.insert(pixmap_ptr, fb.plane0);
             self.qd_pixmap_rowbytes_by_ptr
                 .insert(pixmap_ptr, fb.bytes_per_row);
-            let _ = mem.write(pixmap_ptr, &fb.plane0.to_le_bytes());
-            let _ = mem.write(
+
+            mem.write(pixmap_ptr.wrapping_add(0), &fb.plane0.to_le_bytes())?;
+            mem.write(
                 pixmap_ptr.wrapping_add(4),
-                &(fb.bytes_per_row as u16).to_le_bytes(),
-            );
+                &((fb.bytes_per_row as u16) | 0x8000).to_le_bytes(),
+            )?;
+
             let top: i16 = 0;
             let left: i16 = 0;
             let bottom: i16 = fb.height.min(i16::MAX as u32) as i16;
             let right: i16 = fb.width.min(i16::MAX as u32) as i16;
-            let _ = mem.write(pixmap_ptr.wrapping_add(6), &top.to_le_bytes());
-            let _ = mem.write(pixmap_ptr.wrapping_add(8), &left.to_le_bytes());
-            let _ = mem.write(pixmap_ptr.wrapping_add(10), &bottom.to_le_bytes());
-            let _ = mem.write(pixmap_ptr.wrapping_add(12), &right.to_le_bytes());
+
+            mem.write(pixmap_ptr.wrapping_add(6), &top.to_le_bytes())?;
+            mem.write(pixmap_ptr.wrapping_add(8), &left.to_le_bytes())?;
+            mem.write(pixmap_ptr.wrapping_add(10), &bottom.to_le_bytes())?;
+            mem.write(pixmap_ptr.wrapping_add(12), &right.to_le_bytes())?;
         }
+
         Ok(self.qd_display_port_ptr)
     }
 
@@ -2469,11 +2748,246 @@ impl DyldState {
         }
     }
 
-    fn objc_receiver_class_name(&self, receiver: u32) -> Option<&str> {
-        self.objc_class_ptr_to_name
-            .get(&receiver)
-            .or_else(|| self.objc_object_ptr_to_class.get(&receiver))
-            .map(String::as_str)
+    fn looks_like_objc_class_name(text: &str) -> bool {
+        if text.is_empty() || text.len() > 128 {
+            return false;
+        }
+        let mut chars = text.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return false;
+        }
+        chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    }
+
+    fn objc_runtime_read_class_name(&self, mem: &GuestMemory, class_ptr: u32) -> Option<String> {
+        if class_ptr == 0 {
+            return None;
+        }
+        let name_ptr = Self::read_u32(mem, class_ptr.wrapping_add(8)).ok()?;
+        let name = Self::try_read_ascii_c_string(mem, name_ptr, 256)?;
+        if Self::looks_like_objc_class_name(&name) {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    fn objc_find_runtime_class_ptr_by_name(
+        &mut self,
+        mem: &GuestMemory,
+        class_name: &str,
+    ) -> Option<u32> {
+        if class_name.is_empty() {
+            return None;
+        }
+        let candidate_steps = [40u32, 48u32, 32u32];
+        for (start, end) in &self.objc_class_section_ranges {
+            if *start == 0 || *end <= *start {
+                continue;
+            }
+            for step in candidate_steps {
+                if *end < start.wrapping_add(step) {
+                    continue;
+                }
+                let mut ptr = *start;
+                while ptr.wrapping_add(step) <= *end {
+                    if let Some(name) = self.objc_runtime_read_class_name(mem, ptr) {
+                        self.objc_class_ptr_to_name.insert(ptr, name.clone());
+                        if name == class_name {
+                            return Some(ptr);
+                        }
+                    }
+                    ptr = ptr.wrapping_add(step);
+                }
+            }
+        }
+        None
+    }
+
+    fn objc_resolve_receiver_class_name(
+        &mut self,
+        mem: &GuestMemory,
+        receiver: u32,
+    ) -> Option<String> {
+        if receiver == 0 {
+            return None;
+        }
+        if let Some(name) = self.objc_class_ptr_to_name.get(&receiver).cloned() {
+            return Some(name);
+        }
+        if let Some(name) = self.objc_object_ptr_to_class.get(&receiver).cloned() {
+            return Some(name);
+        }
+
+        if let Some(name) = self.objc_runtime_read_class_name(mem, receiver) {
+            self.objc_class_ptr_to_name.insert(receiver, name.clone());
+            return Some(name);
+        }
+
+        if let Some(name) = Self::try_read_ascii_c_string(mem, receiver, 128) {
+            if Self::looks_like_objc_class_name(&name) {
+                self.objc_class_ptr_to_name.insert(receiver, name.clone());
+                return Some(name);
+            }
+        }
+
+        let isa = Self::read_u32(mem, receiver).ok().unwrap_or(0);
+        if isa != 0 {
+            if let Some(name) = self.objc_class_ptr_to_name.get(&isa).cloned() {
+                self.objc_object_ptr_to_class.insert(receiver, name.clone());
+                return Some(name);
+            }
+            if let Some(name) = self.objc_runtime_read_class_name(mem, isa) {
+                self.objc_class_ptr_to_name.insert(isa, name.clone());
+                self.objc_object_ptr_to_class.insert(receiver, name.clone());
+                return Some(name);
+            }
+            if let Some(name) = Self::try_read_ascii_c_string(mem, isa, 128) {
+                if Self::looks_like_objc_class_name(&name) {
+                    self.objc_class_ptr_to_name.insert(isa, name.clone());
+                    self.objc_object_ptr_to_class.insert(receiver, name.clone());
+                    return Some(name);
+                }
+            }
+            let isa2 = Self::read_u32(mem, isa).ok().unwrap_or(0);
+            if isa2 != 0 {
+                if let Some(name) = self.objc_runtime_read_class_name(mem, isa2) {
+                    self.objc_class_ptr_to_name.insert(isa2, name.clone());
+                    self.objc_object_ptr_to_class.insert(receiver, name.clone());
+                    return Some(name);
+                }
+                if let Some(name) = Self::try_read_ascii_c_string(mem, isa2, 128) {
+                    if Self::looks_like_objc_class_name(&name) {
+                        self.objc_class_ptr_to_name.insert(isa2, name.clone());
+                        self.objc_object_ptr_to_class.insert(receiver, name.clone());
+                        return Some(name);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn objc_scan_method_list_chain(
+        &self,
+        mem: &GuestMemory,
+        list_ptr: u32,
+        selector: &str,
+    ) -> Option<(u32, u32)> {
+        if list_ptr == 0 || selector.is_empty() {
+            return None;
+        }
+        let mut current = list_ptr;
+        let mut visited = HashSet::new();
+        for _ in 0..64u32 {
+            if current == 0 || !visited.insert(current) {
+                break;
+            }
+            let method_count = Self::read_u32(mem, current.wrapping_add(4)).ok()?;
+            if method_count > 4096 {
+                break;
+            }
+            for i in 0..method_count {
+                let entry = current.wrapping_add(8).wrapping_add(i.wrapping_mul(12));
+                let sel_ptr = Self::read_u32(mem, entry).ok().unwrap_or(0);
+                let imp = Self::read_u32(mem, entry.wrapping_add(8)).ok().unwrap_or(0);
+                if sel_ptr == 0 || imp == 0 {
+                    continue;
+                }
+                if let Some(name) = self.objc_selector_name(mem, sel_ptr) {
+                    if name == selector {
+                        return Some((imp, sel_ptr));
+                    }
+                }
+            }
+            current = Self::read_u32(mem, current).ok().unwrap_or(0);
+        }
+        None
+    }
+
+    fn objc_find_method_imp_in_class(
+        &self,
+        mem: &GuestMemory,
+        class_ptr: u32,
+        selector: &str,
+    ) -> Option<(u32, u32)> {
+        if class_ptr == 0 || selector.is_empty() {
+            return None;
+        }
+        let methods_field = Self::read_u32(mem, class_ptr.wrapping_add(28)).ok()?;
+        if methods_field == 0 {
+            return None;
+        }
+
+        if let Some(found) = self.objc_scan_method_list_chain(mem, methods_field, selector) {
+            return Some(found);
+        }
+
+        // 某些 ObjC 运行时布局里 methods 字段是“方法列表指针数组”。
+        // 这里做小范围探测，尽量兼容 ObjC1 旧布局。
+        for i in 0..8u32 {
+            let list_ptr = Self::read_u32(mem, methods_field.wrapping_add(i.wrapping_mul(4)))
+                .ok()
+                .unwrap_or(0);
+            if list_ptr == 0 {
+                break;
+            }
+            if let Some(found) = self.objc_scan_method_list_chain(mem, list_ptr, selector) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn objc_find_instance_method_imp(
+        &mut self,
+        mem: &GuestMemory,
+        receiver: u32,
+        selector: &str,
+    ) -> Option<(u32, u32)> {
+        if receiver == 0 || selector.is_empty() {
+            return None;
+        }
+
+        let class_name_hint = self.objc_resolve_receiver_class_name(mem, receiver);
+        let mut class_ptr = receiver;
+        if self.objc_runtime_read_class_name(mem, class_ptr).is_none() {
+            class_ptr = Self::read_u32(mem, receiver).ok().unwrap_or(0);
+        }
+        if self.objc_runtime_read_class_name(mem, class_ptr).is_none() {
+            if let Some(name) = class_name_hint.as_deref() {
+                if let Some(found) = self.objc_find_runtime_class_ptr_by_name(mem, name) {
+                    class_ptr = found;
+                }
+            }
+        }
+        if class_ptr == 0 {
+            return None;
+        }
+
+        let mut visited = HashSet::new();
+        for _ in 0..32u32 {
+            if class_ptr == 0 || !visited.insert(class_ptr) {
+                break;
+            }
+
+            if let Some(name) = self.objc_runtime_read_class_name(mem, class_ptr) {
+                self.objc_class_ptr_to_name.insert(class_ptr, name);
+            }
+
+            if let Some(found) = self.objc_find_method_imp_in_class(mem, class_ptr, selector) {
+                return Some(found);
+            }
+
+            class_ptr = Self::read_u32(mem, class_ptr.wrapping_add(4))
+                .ok()
+                .unwrap_or(0);
+        }
+        None
     }
 
     fn objc_alloc_object(
@@ -2532,6 +3046,7 @@ impl DyldState {
         if receiver == 0 || plane0 == 0 {
             return;
         }
+        self.graphics_requested = true;
         let width = width.max(1);
         let height = height.max(1);
         let bits_per_pixel = bits_per_pixel.max(8);
@@ -2571,6 +3086,7 @@ impl DyldState {
         if receiver == 0 || plane0 == 0 {
             return None;
         }
+        self.graphics_requested = true;
         if let Some(meta) = self.objc_bitmap_meta.get(&receiver).copied() {
             return Some(meta);
         }
@@ -2661,8 +3177,162 @@ impl DyldState {
         }
     }
 
+    pub fn ensure_graphics_bootstrap(
+        &mut self,
+        mem: &mut GuestMemory,
+        width: u32,
+        height: u32,
+        bits_per_pixel: u32,
+    ) -> Result<GuestFramebufferInfo, guestmem::Error> {
+        self.graphics_requested = true;
+        // 把宿主图形对象映射为 guest 可见的“主显示缓冲”：
+        // - CGDisplayBaseAddress / BytesPerRow 读取这块内存
+        // - QuickDraw 的 GWorld/PixMap 链路也同步指向同一 plane0
+        self.cg_display_width = width.max(320);
+        self.cg_display_height = height.max(200);
+        self.cg_display_bits_per_pixel = bits_per_pixel.max(8);
+        self.cg_display_bytes_per_row = 0;
+        let fb = self.ensure_cg_display_buffer(mem)?;
+        let _ = self.ensure_qd_display_port(mem)?;
+        Ok(fb)
+    }
+
+    pub fn graphics_requested(&self) -> bool {
+        self.graphics_requested
+            || self.objc_window_title.is_some()
+            || self.objc_primary_bitmap != 0
+            || self.cg_display_base_ptr != 0
+    }
+
     pub fn guest_window_title(&self) -> Option<String> {
         self.objc_window_title.clone()
+    }
+
+    pub fn push_host_ui_event(&mut self, event: HostUiEvent) {
+        match event {
+            HostUiEvent::MouseMove { x, y } => {
+                self.ui_last_mouse_x = x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                self.ui_last_mouse_y = y.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                self.ui_events.push_back(HostUiEvent::MouseMove { x, y });
+            }
+            HostUiEvent::MouseDown { button, x, y } => {
+                self.ui_last_mouse_x = x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                self.ui_last_mouse_y = y.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                if (1..=16).contains(&button) {
+                    self.ui_mouse_buttons |= 1u16 << (button - 1);
+                }
+                self.ui_events
+                    .push_back(HostUiEvent::MouseDown { button, x, y });
+            }
+            HostUiEvent::MouseUp { button, x, y } => {
+                self.ui_last_mouse_x = x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                self.ui_last_mouse_y = y.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                if (1..=16).contains(&button) {
+                    self.ui_mouse_buttons &= !(1u16 << (button - 1));
+                }
+                self.ui_events
+                    .push_back(HostUiEvent::MouseUp { button, x, y });
+            }
+            other => self.ui_events.push_back(other),
+        }
+    }
+
+    pub fn host_mouse_position(&self) -> (i16, i16) {
+        (self.ui_last_mouse_x, self.ui_last_mouse_y)
+    }
+
+    pub fn set_host_clipboard_text(&mut self, text: String) {
+        self.ui_scrap_text = text.into_bytes();
+        self.ui_scrap_dirty_from_guest = false;
+    }
+
+    pub fn take_guest_clipboard_update(&mut self) -> Option<String> {
+        if !self.ui_scrap_dirty_from_guest {
+            return None;
+        }
+        self.ui_scrap_dirty_from_guest = false;
+        String::from_utf8(self.ui_scrap_text.clone()).ok()
+    }
+
+    fn event_record_for(&self, event: &HostUiEvent) -> GuestEventRecord {
+        let when_ticks = Self::tick_count_60hz();
+        let mut rec = GuestEventRecord {
+            what: EVENT_NULL,
+            message: 0,
+            when_ticks,
+            where_v: self.ui_last_mouse_y,
+            where_h: self.ui_last_mouse_x,
+            modifiers: self.ui_mouse_buttons,
+        };
+        match event {
+            HostUiEvent::Quit => {
+                rec.what = EVENT_OS;
+                rec.message = 0;
+            }
+            HostUiEvent::KeyDown { keycode } => {
+                rec.what = EVENT_KEY_DOWN;
+                rec.message = (*keycode as u32) & 0xFF;
+            }
+            HostUiEvent::KeyUp { keycode } => {
+                rec.what = EVENT_KEY_UP;
+                rec.message = (*keycode as u32) & 0xFF;
+            }
+            HostUiEvent::MouseMove { x, y } => {
+                rec.what = EVENT_NULL;
+                rec.where_h = (*x).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                rec.where_v = (*y).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+            HostUiEvent::MouseDown { button, x, y } => {
+                rec.what = EVENT_MOUSE_DOWN;
+                rec.message = *button as u32;
+                rec.where_h = (*x).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                rec.where_v = (*y).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+            HostUiEvent::MouseUp { button, x, y } => {
+                rec.what = EVENT_MOUSE_UP;
+                rec.message = *button as u32;
+                rec.where_h = (*x).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                rec.where_v = (*y).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+            HostUiEvent::MouseWheel { x, y } => {
+                rec.what = EVENT_OS;
+                rec.message = (((*y as i16) as u16 as u32) << 16) | ((*x as i16) as u16 as u32);
+            }
+            HostUiEvent::TextInput { text } => {
+                rec.what = EVENT_KEY_DOWN;
+                rec.message = text.bytes().next().unwrap_or_default() as u32;
+            }
+        }
+        rec
+    }
+
+    fn fill_event_record(
+        &mut self,
+        mem: &mut GuestMemory,
+        event_record_ptr: u32,
+        consume: bool,
+    ) -> Result<bool, guestmem::Error> {
+        let ev = if consume {
+            self.ui_events.pop_front()
+        } else {
+            self.ui_events.front().cloned()
+        };
+        if let Some(event) = ev {
+            let rec = self.event_record_for(&event);
+            Self::write_event_record(mem, event_record_ptr, rec)?;
+            Ok(true)
+        } else {
+            let rec = GuestEventRecord {
+                what: EVENT_NULL,
+                message: 0,
+                when_ticks: Self::tick_count_60hz(),
+                where_v: self.ui_last_mouse_y,
+                where_h: self.ui_last_mouse_x,
+                modifiers: self.ui_mouse_buttons,
+            };
+            Self::write_event_record(mem, event_record_ptr, rec)?;
+            Ok(false)
+        }
     }
 
     pub fn main_thread_tid(&self) -> u32 {
@@ -2725,11 +3395,14 @@ impl DyldState {
         cpu.fpu_stack.clear();
         cpu.trace = template.trace;
 
-        let info = self.pthread_info.entry(req.tid).or_insert(GuestPthreadInfo {
-            detached: false,
-            exited: false,
-            retval: 0,
-        });
+        let info = self
+            .pthread_info
+            .entry(req.tid)
+            .or_insert(GuestPthreadInfo {
+                detached: false,
+                exited: false,
+                retval: 0,
+            });
         info.exited = false;
         info.retval = 0;
         let prev_tid = self.current_thread_tid;
@@ -2845,6 +3518,55 @@ impl DyldState {
         mem.write(data_ptr.wrapping_add(len), &[0])?;
         mem.write(string_obj_ptr, &data_ptr.to_le_bytes())?;
         Ok(())
+    }
+
+    fn resolve_istringstream_key(&self, stream_ptr: u32) -> Option<u32> {
+        if self.gnu_istringstream_text.contains_key(&stream_ptr) {
+            return Some(stream_ptr);
+        }
+        // 兼容 this 指针被转成基类指针后的轻微偏移。
+        let mut best: Option<(u32, u32)> = None;
+        for &key in self.gnu_istringstream_text.keys() {
+            let dist = if key >= stream_ptr {
+                key - stream_ptr
+            } else {
+                stream_ptr - key
+            };
+            if dist <= 0x80 && best.map(|(d, _)| dist < d).unwrap_or(true) {
+                best = Some((dist, key));
+            }
+        }
+        best.map(|(_, key)| key)
+    }
+
+    fn parse_ascii_i32(bytes: &[u8], start: usize) -> (usize, Option<i32>) {
+        let mut i = start.min(bytes.len());
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut sign = 1i64;
+        if i < bytes.len() {
+            if bytes[i] == b'-' {
+                sign = -1;
+                i += 1;
+            } else if bytes[i] == b'+' {
+                i += 1;
+            }
+        }
+        let digit_start = i;
+        let mut value = 0i64;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add((bytes[i] - b'0') as i64);
+            i += 1;
+        }
+        if i == digit_start {
+            return (start.min(bytes.len()), None);
+        }
+        let signed = value.saturating_mul(sign);
+        let clamped = signed.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        (i, Some(clamped))
     }
 
     fn next_file_fd(&mut self) -> u32 {
@@ -3092,6 +3814,27 @@ impl DyldState {
         Ok(())
     }
 
+    fn import_unwind_one_frame(cpu: &mut Cpu, mem: &GuestMemory) -> Result<(), DyldError> {
+        // __Unwind_Resume 为 noreturn。这里做“一层栈展开”近似：
+        // 直接回到调用者帧，避免把控制流错误地落到下一符号入口。
+        if cpu.ebp != 0 {
+            let saved_ebp = Self::read_u32(mem, cpu.ebp)?;
+            let ret_addr = Self::read_u32(mem, cpu.ebp.wrapping_add(4))?;
+            if let Ok(saved_ebx) = Self::read_u32(mem, cpu.ebp.wrapping_sub(8)) {
+                cpu.ebx = saved_ebx;
+            }
+            cpu.esp = cpu.ebp.wrapping_add(8);
+            cpu.ebp = saved_ebp;
+            cpu.eip = ret_addr;
+            return Ok(());
+        }
+
+        let ret_addr = Self::read_u32(mem, cpu.esp)?;
+        cpu.esp = cpu.esp.wrapping_add(4);
+        cpu.eip = ret_addr;
+        Ok(())
+    }
+
     fn noop_import(
         &mut self,
         cpu: &mut Cpu,
@@ -3171,6 +3914,25 @@ impl DyldState {
         let symbol_core = symbol_norm.strip_prefix('_').unwrap_or(symbol_norm);
 
         // C++ operator new/new[] 的常见 Itanium ABI 名称。
+
+        if symbol_core.starts_with("ZNSsC1IPcE") || symbol_core.starts_with("ZNSsC2IPcE") {
+            let this_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+            let first_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+            let last_ptr = Self::read_arg_u32(mem, cpu, 2)?;
+
+            let bytes = if first_ptr != 0 && last_ptr >= first_ptr {
+                let len = last_ptr.wrapping_sub(first_ptr).min(64 * 1024);
+                Self::read_guest_bytes(mem, first_ptr, len, 64 * 1024)
+            } else {
+                Vec::new()
+            };
+
+            let _ = self.gnu_string_write_bytes(mem, this_ptr, &bytes);
+            cpu.eax = this_ptr;
+            Self::import_return(cpu, mem)?;
+            return Ok(());
+        }
+
         if matches!(
             symbol_core,
             "Znwj" | "Znwm" | "Znaj" | "Znam" | "ZnwjRKSt9nothrow_t" | "ZnwmRKSt9nothrow_t"
@@ -3224,6 +3986,71 @@ impl DyldState {
             let rhs = Self::read_arg_u32(mem, cpu, 1)?;
             let bytes = Self::gnu_string_read_bytes(mem, rhs, 64 * 1024);
             let _ = self.gnu_string_write_bytes(mem, this_ptr, &bytes);
+            cpu.eax = this_ptr;
+            Self::import_return(cpu, mem)?;
+            return Ok(());
+        }
+
+        if symbol_core.starts_with("ZNSs7reserveEm") {
+            // 对旧版 libstdc++ 的 reserve 做最小兼容：不触发容量变更，只返回 this。
+            let this_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+            cpu.eax = this_ptr;
+            Self::import_return(cpu, mem)?;
+            return Ok(());
+        }
+
+        if symbol_core.starts_with(
+            "ZNSt19basic_istringstreamIcSt11char_traitsIcESaIcEEC1ERKSsSt13_Ios_Openmode",
+        ) || symbol_core.starts_with(
+            "ZNSt19basic_istringstreamIcSt11char_traitsIcESaIcEEC2ERKSsSt13_Ios_Openmode",
+        ) {
+            let this_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+            let src_string_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+            let text = Self::gnu_string_read_bytes(mem, src_string_ptr, 64 * 1024);
+            self.gnu_istringstream_text.insert(this_ptr, text);
+            self.gnu_istringstream_cursor.insert(this_ptr, 0);
+            cpu.eax = this_ptr;
+            Self::import_return(cpu, mem)?;
+            return Ok(());
+        }
+
+        if symbol_core.starts_with("ZNSt19basic_istringstreamIcSt11char_traitsIcESaIcEED1Ev")
+            || symbol_core.starts_with("ZNSt19basic_istringstreamIcSt11char_traitsIcESaIcEED2Ev")
+        {
+            let this_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+            if let Some(key) = self.resolve_istringstream_key(this_ptr) {
+                self.gnu_istringstream_text.remove(&key);
+                self.gnu_istringstream_cursor.remove(&key);
+            }
+            cpu.eax = this_ptr;
+            Self::import_return(cpu, mem)?;
+            return Ok(());
+        }
+
+        if symbol_core.starts_with("ZNSirsERi") {
+            let this_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+            let out_int_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+            let mut out_value = 0i32;
+            if let Some(key) = self.resolve_istringstream_key(this_ptr) {
+                let cursor = self
+                    .gnu_istringstream_cursor
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0);
+                let text = self
+                    .gnu_istringstream_text
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                let (next_cursor, parsed) = Self::parse_ascii_i32(&text, cursor);
+                self.gnu_istringstream_cursor.insert(key, next_cursor);
+                if let Some(v) = parsed {
+                    out_value = v;
+                }
+            }
+            if out_int_ptr != 0 {
+                let _ = mem.write(out_int_ptr, &out_value.to_le_bytes());
+            }
             cpu.eax = this_ptr;
             Self::import_return(cpu, mem)?;
             return Ok(());
@@ -3504,29 +4331,82 @@ impl DyldState {
                 let sym_ptr = Self::read_arg_u32(mem, cpu, 1)?;
                 let sym = Self::read_c_string(mem, sym_ptr, 1024).unwrap_or_default();
                 let mut resolved = None;
+                let mut resolved_handle = 0u32;
                 if handle == 0 || handle == 0xffff_fffe {
                     resolved = Self::lookup_export(&self.main_exports, &sym);
                     if resolved.is_none() {
-                        for image in self.loaded_images.values() {
+                        for (&h, image) in &self.loaded_images {
                             resolved = Self::lookup_export(&image.exports, &sym);
                             if resolved.is_some() {
+                                resolved_handle = h;
                                 break;
                             }
                         }
                     }
                 } else if let Some(image) = self.loaded_images.get(&handle) {
                     resolved = Self::lookup_export(&image.exports, &sym);
+                    if resolved.is_some() {
+                        resolved_handle = handle;
+                    }
                 }
 
                 if let Some(addr) = resolved {
                     self.set_dlerror(mem, None)?;
-                    cpu.eax = addr;
+                    let mut init_funcs = Vec::new();
+                    let mut init_handles = Vec::new();
+                    if resolved_handle != 0 {
+                        // 通用策略：dlsym 返回可调用入口前，先按加载顺序运行已加载镜像里
+                        // 尚未执行的初始化器（至少覆盖“依赖先于当前镜像”这一基本顺序）。
+                        let mut handles: Vec<u32> = self
+                            .loaded_images
+                            .keys()
+                            .copied()
+                            .filter(|h| *h <= resolved_handle)
+                            .collect();
+                        handles.sort_unstable();
+                        for h in handles {
+                            let mut funcs = self.take_pending_initializers(h);
+                            if !funcs.is_empty() {
+                                init_handles.push((h, funcs.len()));
+                                init_funcs.append(&mut funcs);
+                            }
+                        }
+                    }
                     if self.trace {
                         eprintln!(
                             "[DYLD] dlsym(handle={}, symbol='{}') -> {:#010x}",
                             handle, sym, addr
                         );
+                        if !init_funcs.is_empty() {
+                            eprintln!(
+                                "[DYLD] running {} initializer(s) before returning symbol from handle {}",
+                                init_funcs.len(),
+                                resolved_handle
+                            );
+                            for (h, n) in &init_handles {
+                                eprintln!("[DYLD]   initializer batch: handle {} -> {} func(s)", h, n);
+                            }
+                        }
                     }
+
+                    if !init_funcs.is_empty() {
+                        // dlsym 返回函数指针时，如果目标镜像还没跑初始化器，
+                        // 先执行初始化器，再把符号地址放到 EAX 返回给调用者。
+                        let caller_ret = Self::read_u32(mem, cpu.esp)?;
+                        cpu.esp = cpu.esp.wrapping_add(4);
+
+                        cpu.esp = cpu.esp.wrapping_sub(4);
+                        mem.write(cpu.esp, &caller_ret.to_le_bytes())?;
+
+                        cpu.esp = cpu.esp.wrapping_sub(4);
+                        mem.write(cpu.esp, &addr.to_le_bytes())?;
+
+                        let pop_eax_ret = self.ensure_dyld_pop_eax_ret_stub(mem)?;
+                        self.schedule_calls_before_target(cpu, mem, &init_funcs, pop_eax_ret)?;
+                        return Ok(());
+                    }
+
+                    cpu.eax = addr;
                 } else {
                     self.set_dlerror(
                         mem,
@@ -3627,6 +4507,10 @@ impl DyldState {
                 let class_name = Self::read_c_string(mem, name_ptr, 256).unwrap_or_default();
                 let cls = if class_name.is_empty() {
                     self.alloc_heap(mem, 16, true)?
+                } else if let Some(ptr) = self.objc_find_runtime_class_ptr_by_name(mem, &class_name)
+                {
+                    self.objc_class_ptr_to_name.insert(ptr, class_name.clone());
+                    ptr
                 } else if let Some((&ptr, _)) = self
                     .objc_class_ptr_to_name
                     .iter()
@@ -3651,40 +4535,80 @@ impl DyldState {
                 let selector = self
                     .objc_selector_name(mem, selector_ptr)
                     .unwrap_or_else(|| "<unknown>".to_string());
-                let mut class_name = self
-                    .objc_receiver_class_name(receiver)
-                    .map(|s| s.to_string());
-                if class_name.is_none() && self.is_dosbox_main() {
-                    class_name = match receiver {
-                        0x001b8954 => Some("SDLApplication".to_string()),
-                        0x001b894c => Some("SDLMain".to_string()),
-                        _ => None,
-                    };
-                }
+                let class_name = self.objc_resolve_receiver_class_name(mem, receiver);
                 self.objc_log_call_once(receiver, class_name.as_deref(), &selector);
 
-                // DOSBox(i386) 的 Cocoa 启动入口依赖 NSApp run 触发 SDLMain delegate。
-                // 在缺失完整 ObjC runtime 的情况下，手工把 run 转发到
-                // `-[SDLMain applicationDidFinishLaunching:]`，让主循环真正启动。
-                if selector == "run" && self.is_dosbox_main() && !self.objc_sdl_launched {
+                // 通用策略：当 NSApp run 被调用且存在 delegate 时，尽量从 ObjC 元数据
+                // 里解析 `applicationDidFinishLaunching:` 的真实 IMP 并跳转执行。
+                if selector == "run" && !self.objc_run_delegate_dispatched.contains(&receiver) {
+                    self.objc_run_delegate_dispatched.insert(receiver);
                     if let Some(&delegate) = self.objc_app_delegate.get(&receiver) {
                         if delegate != 0 {
-                            let method_imp = 0x001a858cu32;
-                            let nil_obj = 0u32;
-                            mem.write(cpu.esp.wrapping_add(4), &delegate.to_le_bytes())?;
-                            mem.write(cpu.esp.wrapping_add(8), &selector_ptr.to_le_bytes())?;
-                            mem.write(cpu.esp.wrapping_add(12), &nil_obj.to_le_bytes())?;
-                            self.objc_sdl_launched = true;
-                            cpu.eip = method_imp;
-                            return Ok(());
+                            if let Some((method_imp, finish_sel_ptr)) = self
+                                .objc_find_instance_method_imp(
+                                    mem,
+                                    delegate,
+                                    "applicationDidFinishLaunching:",
+                                )
+                            {
+                                let nil_obj = 0u32;
+                                mem.write(cpu.esp.wrapping_add(4), &delegate.to_le_bytes())?;
+                                mem.write(cpu.esp.wrapping_add(8), &finish_sel_ptr.to_le_bytes())?;
+                                mem.write(cpu.esp.wrapping_add(12), &nil_obj.to_le_bytes())?;
+                                if self.trace {
+                                    eprintln!(
+                                        "[DYLD] objc run -> delegate launch dispatch receiver={:#010x} delegate={:#010x} imp={:#010x}",
+                                        receiver, delegate, method_imp
+                                    );
+                                }
+                                cpu.eip = method_imp;
+                                return Ok(());
+                            } else if self.trace {
+                                eprintln!(
+                                    "[DYLD] objc run delegate dispatch skipped: no method 'applicationDidFinishLaunching:' for delegate={:#010x}",
+                                    delegate
+                                );
+                            }
                         }
                     }
                 }
 
                 cpu.eax = match selector.as_str() {
                     "alloc" | "new" => {
-                        let cls = class_name.as_deref().unwrap_or("NSObject");
-                        self.objc_alloc_object(mem, cls)?
+                        let cls = if let Some(name) = class_name.as_deref() {
+                            name.to_string()
+                        } else if let Some(name) = Self::try_read_ascii_c_string(mem, receiver, 128)
+                            .filter(|s| Self::looks_like_objc_class_name(s))
+                        {
+                            self.objc_class_ptr_to_name.insert(receiver, name.clone());
+                            name
+                        } else {
+                            let via_ptr = Self::read_u32(mem, receiver)
+                                .ok()
+                                .and_then(|p| Self::try_read_ascii_c_string(mem, p, 128))
+                                .filter(|s| Self::looks_like_objc_class_name(s));
+                            if let Some(name) = via_ptr {
+                                self.objc_class_ptr_to_name.insert(receiver, name.clone());
+                                name
+                            } else {
+                                "NSObject".to_string()
+                            }
+                        };
+                        let obj = self.objc_alloc_object(mem, &cls)?;
+                        // 对类消息 `+[Class alloc/new]`，对象首字写入 class 指针，
+                        // 便于后续按 isa 解析方法表。
+                        let mut isa_ptr = receiver;
+                        if self.objc_runtime_read_class_name(mem, isa_ptr).is_none() {
+                            if let Some(real_cls_ptr) =
+                                self.objc_find_runtime_class_ptr_by_name(mem, &cls)
+                            {
+                                isa_ptr = real_cls_ptr;
+                            }
+                        }
+                        if isa_ptr != 0 {
+                            let _ = mem.write(obj, &isa_ptr.to_le_bytes());
+                        }
+                        obj
                     }
                     "sharedApplication" => {
                         let cls = class_name
@@ -3833,6 +4757,7 @@ impl DyldState {
                         let title_obj = Self::read_arg_u32(mem, cpu, 2)?;
                         if let Some(title) = self.objc_resolve_text_arg(mem, title_obj) {
                             self.objc_window_title = Some(title);
+                            self.graphics_requested = true;
                         }
                         receiver
                     }
@@ -3879,9 +4804,7 @@ impl DyldState {
                 let selector = self
                     .objc_selector_name(mem, selector_ptr)
                     .unwrap_or_else(|| "<unknown>".to_string());
-                let class_name = self
-                    .objc_receiver_class_name(receiver)
-                    .map(|s| s.to_string());
+                let class_name = self.objc_resolve_receiver_class_name(mem, receiver);
                 self.objc_log_call_once(
                     receiver,
                     class_name.as_deref(),
@@ -3905,7 +4828,12 @@ impl DyldState {
             "objc_msgSend_stret" => {
                 let ret_ptr = Self::read_arg_u32(mem, cpu, 0)?;
                 cpu.eax = ret_ptr;
-                Self::import_return(cpu, mem)?;
+                // i386 下 objc_msgSend_stret 采用与普通 cdecl 不同的栈约定，
+                // 返回时等价于 `ret 4`（额外弹出一个参数槽）。
+                // 若按普通 import_return 仅弹返回地址，会导致调用方后续栈失衡。
+                let ret_addr = Self::read_u32(mem, cpu.esp)?;
+                cpu.esp = cpu.esp.wrapping_add(8);
+                cpu.eip = ret_addr;
                 Ok(())
             }
             "objc_msgSend_fpret" => {
@@ -3933,6 +4861,10 @@ impl DyldState {
                     return Ok(());
                 }
                 if guard[0] != 0 {
+                    cpu.eax = 0;
+                } else if guard[1] != 0 {
+                    // 另一个线程（或递归路径）正在初始化。
+                    // 先返回“无需再次初始化”，避免同一 guard 被重复构造导致卡住。
                     cpu.eax = 0;
                 } else {
                     // 单线程简化语义：未初始化时抢占并返回 1，后续 release 写入已初始化标记。
@@ -4004,6 +4936,11 @@ impl DyldState {
                     cpu.esp = cpu.esp.wrapping_add(16);
                     cpu.eip = ret_addr;
                 }
+                Ok(())
+            }
+            "__Unwind_Resume" | "_Unwind_Resume" | "Unwind_Resume" => {
+                let _exc_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+                Self::import_unwind_one_frame(cpu, mem)?;
                 Ok(())
             }
             "__udivdi3" | "_udivdi3" => {
@@ -4102,6 +5039,36 @@ impl DyldState {
                 self.pthread_key_values.remove(&key);
                 cpu.eax = 0;
                 Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "pthread_once" | "pthread_once$UNIX2003" => {
+                let once_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+                let init_routine = Self::read_arg_u32(mem, cpu, 1)?;
+                if once_ptr == 0 || init_routine == 0 {
+                    self.set_errno(mem, ERRNO_EINVAL)?;
+                    cpu.eax = ERRNO_EINVAL;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+                if self.pthread_once_done.contains(&once_ptr) {
+                    self.clear_errno(mem)?;
+                    cpu.eax = 0;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+
+                // 单进程/单地址语义：首次调用执行回调，后续直接成功返回。
+                self.pthread_once_done.insert(once_ptr);
+                let cont_stub = self.ensure_pthread_once_continue_stub(mem, cpu)?;
+                let caller_ret = Self::read_u32(mem, cpu.esp)?;
+                let tid = self.current_thread_tid.max(1);
+                self.pthread_once_pending_ret_by_tid
+                    .entry(tid)
+                    .or_default()
+                    .push(caller_ret);
+                mem.write(cpu.esp, &cont_stub.to_le_bytes())?;
+                self.clear_errno(mem)?;
+                cpu.eip = init_routine;
                 Ok(())
             }
             "pthread_create" | "pthread_create$UNIX2003" => {
@@ -5515,6 +6482,23 @@ impl DyldState {
                 Self::import_return(cpu, mem)?;
                 Ok(())
             }
+            "CFRunLoopRun" => {
+                // 真实实现应阻塞并驱动 source/timer；这里由宿主主循环持续泵事件，
+                // 因此 guest 调用 Run 可以立即返回，保持流程前进。
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "CFRunLoopRunInMode" => {
+                let _mode = Self::read_arg_u32(mem, cpu, 0)?;
+                let _seconds_raw = Self::read_arg_u32(mem, cpu, 1)?;
+                let _return_after_source = Self::read_arg_u32(mem, cpu, 2)?;
+                self.clear_errno(mem)?;
+                cpu.eax = 1; // kCFRunLoopRunTimedOut (近似)
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
             "CFRelease" => {
                 let _obj = Self::read_arg_u32(mem, cpu, 0)?;
                 self.clear_errno(mem)?;
@@ -5530,6 +6514,7 @@ impl DyldState {
             }
             "CGDisplayCurrentMode" => {
                 let _display_id = Self::read_arg_u32(mem, cpu, 0)?;
+                let _ = self.ensure_cg_display_buffer(mem)?;
                 cpu.eax = self.ensure_cg_display_mode_ptr(mem)?;
                 self.clear_errno(mem)?;
                 Self::import_return(cpu, mem)?;
@@ -5537,6 +6522,7 @@ impl DyldState {
             }
             "CGDisplayAvailableModes" => {
                 let _display_id = Self::read_arg_u32(mem, cpu, 0)?;
+                let _ = self.ensure_cg_display_buffer(mem)?;
                 cpu.eax = self.ensure_cg_display_modes_array_ptr(mem)?;
                 self.clear_errno(mem)?;
                 Self::import_return(cpu, mem)?;
@@ -5548,21 +6534,26 @@ impl DyldState {
                 let width = Self::read_arg_u32(mem, cpu, 2)?;
                 let height = Self::read_arg_u32(mem, cpu, 3)?;
                 let exact_match_ptr = Self::read_arg_u32(mem, cpu, 4)?;
-                if width != 0 {
+
+                if width >= 160 {
                     self.cg_display_width = width;
                 }
-                if height != 0 {
+                if height >= 120 {
                     self.cg_display_height = height;
                 }
                 if bpp != 0 {
-                    self.cg_display_bits_per_pixel = bpp;
+                    self.cg_display_bits_per_pixel = bpp.max(8);
                 }
+
                 let bytes_per_pixel = ((self.cg_display_bits_per_pixel + 7) / 8).max(1);
                 self.cg_display_bytes_per_row =
                     self.cg_display_width.max(1).saturating_mul(bytes_per_pixel);
+
+                let _ = self.ensure_cg_display_buffer(mem)?;
                 if exact_match_ptr != 0 {
                     let _ = mem.write(exact_match_ptr, &1u32.to_le_bytes());
                 }
+
                 cpu.eax = self.ensure_cg_display_mode_ptr(mem)?;
                 self.clear_errno(mem)?;
                 Self::import_return(cpu, mem)?;
@@ -5571,7 +6562,8 @@ impl DyldState {
             "CGDisplaySwitchToMode" => {
                 let _display_id = Self::read_arg_u32(mem, cpu, 0)?;
                 let _mode = Self::read_arg_u32(mem, cpu, 1)?;
-                let _ = self.ensure_cg_display_buffer(mem);
+                let _ = self.ensure_cg_display_buffer(mem)?;
+                let _ = self.ensure_qd_display_port(mem)?;
                 self.clear_errno(mem)?;
                 cpu.eax = 0;
                 Self::import_return(cpu, mem)?;
@@ -5612,17 +6604,22 @@ impl DyldState {
                 if out_port_ptr != 0 {
                     let _ = mem.write(out_port_ptr, &port.to_le_bytes());
                 }
+                self.qd_current_port_ptr = port;
                 self.clear_errno(mem)?;
-                // OSErr: noErr
-                cpu.eax = 0;
+                cpu.eax = 0; // noErr
                 Self::import_return(cpu, mem)?;
                 Ok(())
             }
             "GetPort" => {
                 let out_port_ptr = Self::read_arg_u32(mem, cpu, 0)?;
                 let port = self.ensure_qd_display_port(mem)?;
+                let current = if self.qd_current_port_ptr != 0 {
+                    self.qd_current_port_ptr
+                } else {
+                    port
+                };
                 if out_port_ptr != 0 {
-                    let _ = mem.write(out_port_ptr, &self.qd_current_port_ptr.max(port).to_le_bytes());
+                    let _ = mem.write(out_port_ptr, &current.to_le_bytes());
                 }
                 self.clear_errno(mem)?;
                 cpu.eax = 0;
@@ -5631,8 +6628,268 @@ impl DyldState {
             }
             "SetPort" => {
                 let port_ptr = Self::read_arg_u32(mem, cpu, 0)?;
-                let port = self.ensure_qd_display_port(mem)?;
-                self.qd_current_port_ptr = if port_ptr != 0 { port_ptr } else { port };
+                let default_port = self.ensure_qd_display_port(mem)?;
+                self.qd_current_port_ptr = if port_ptr != 0 {
+                    port_ptr
+                } else {
+                    default_port
+                };
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "TickCount" | "LMGetTicks" => {
+                self.clear_errno(mem)?;
+                cpu.eax = Self::tick_count_60hz();
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "GetMouse" => {
+                let pt_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+                let (x, y) = self.host_mouse_position();
+                if pt_ptr != 0 {
+                    // QuickDraw Point: v (y), h (x)
+                    let _ = mem.write(pt_ptr, &y.to_le_bytes());
+                    let _ = mem.write(pt_ptr.wrapping_add(2), &x.to_le_bytes());
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "Button" | "StillDown" => {
+                self.clear_errno(mem)?;
+                cpu.eax = if self.ui_mouse_buttons & 0x1 != 0 { 1 } else { 0 };
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "EventAvail" => {
+                let _mask = Self::read_arg_u32(mem, cpu, 0)?;
+                let event_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+                let has_event = self.fill_event_record(mem, event_ptr, false)?;
+                self.clear_errno(mem)?;
+                cpu.eax = if has_event { 1 } else { 0 };
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "GetNextEvent" => {
+                let _mask = Self::read_arg_u32(mem, cpu, 0)?;
+                let event_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+                let has_event = self.fill_event_record(mem, event_ptr, true)?;
+                self.clear_errno(mem)?;
+                cpu.eax = if has_event { 1 } else { 0 };
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "WaitNextEvent" => {
+                let _mask = Self::read_arg_u32(mem, cpu, 0)?;
+                let event_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+                let sleep_ticks = Self::read_arg_u32(mem, cpu, 2)?;
+                let _mouse_rgn = Self::read_arg_u32(mem, cpu, 3)?;
+
+                let has_event = self.fill_event_record(mem, event_ptr, true)?;
+                if !has_event && sleep_ticks != 0 {
+                    // QuickDraw ticks ~= 60Hz。限制最大等待，避免阻塞过久。
+                    let ms = (sleep_ticks as u64).saturating_mul(1000) / 60;
+                    std::thread::sleep(Duration::from_millis(ms.min(16)));
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = if has_event { 1 } else { 0 };
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "GetKeys" => {
+                let keys_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+                if keys_ptr != 0 {
+                    let zero = [0u8; 16];
+                    let _ = mem.write(keys_ptr, &zero);
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "GetCurrentEventTime" => {
+                let dur = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO);
+                let seconds = dur.as_secs_f64();
+                let bits = seconds.to_bits().to_le_bytes();
+                // i386 fpret 调用约定复杂，这里把 double 写入 ST(0) 无法直接做；
+                // 退化为返回低 32 位供“非零即可”路径，常见代码会容忍。
+                cpu.eax = u32::from_le_bytes([bits[0], bits[1], bits[2], bits[3]]);
+                self.clear_errno(mem)?;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "RunApplicationEventLoop" => {
+                // 由宿主主循环持续泵事件；这里不阻塞。
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "QuitApplicationEventLoop" => {
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "ReceiveNextEvent" => {
+                let _count = Self::read_arg_u32(mem, cpu, 0)?;
+                let _list_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+                let _timeout_ptr = Self::read_arg_u32(mem, cpu, 2)?;
+                let _pull_mode = Self::read_arg_u32(mem, cpu, 3)?;
+                let out_event = Self::read_arg_u32(mem, cpu, 4)?;
+                let has_event = self.fill_event_record(mem, out_event, true)?;
+                self.clear_errno(mem)?;
+                cpu.eax = if has_event { 0 } else { ERRNO_ETIMEDOUT };
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "GetCurrentScrap" => {
+                let scrap_ref_ptr = Self::read_arg_u32(mem, cpu, 0)?;
+                if scrap_ref_ptr != 0 {
+                    let _ = mem.write(scrap_ref_ptr, &1u32.to_le_bytes());
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "ClearCurrentScrap" => {
+                self.ui_scrap_text.clear();
+                self.ui_scrap_dirty_from_guest = true;
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "PutScrapFlavor" => {
+                let _scrap_ref = Self::read_arg_u32(mem, cpu, 0)?;
+                let _flavor = Self::read_arg_u32(mem, cpu, 1)?;
+                let _flags = Self::read_arg_u32(mem, cpu, 2)?;
+                let size = Self::read_arg_u32(mem, cpu, 3)? as usize;
+                let data_ptr = Self::read_arg_u32(mem, cpu, 4)?;
+                if data_ptr != 0 && size > 0 {
+                    let mut buf = vec![0u8; size.min(1024 * 1024)];
+                    if mem.read(data_ptr, &mut buf).is_ok() {
+                        self.ui_scrap_text = buf;
+                        self.ui_scrap_dirty_from_guest = true;
+                    }
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "GetScrapFlavorSize" => {
+                let _scrap_ref = Self::read_arg_u32(mem, cpu, 0)?;
+                let _flavor = Self::read_arg_u32(mem, cpu, 1)?;
+                let out_size_ptr = Self::read_arg_u32(mem, cpu, 2)?;
+                if out_size_ptr != 0 {
+                    let sz = self.ui_scrap_text.len().min(i32::MAX as usize) as i32;
+                    let _ = mem.write(out_size_ptr, &sz.to_le_bytes());
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "GetScrapFlavorData" => {
+                let _scrap_ref = Self::read_arg_u32(mem, cpu, 0)?;
+                let _flavor = Self::read_arg_u32(mem, cpu, 1)?;
+                let io_size_ptr = Self::read_arg_u32(mem, cpu, 2)?;
+                let out_data_ptr = Self::read_arg_u32(mem, cpu, 3)?;
+                let requested = if io_size_ptr != 0 {
+                    Self::read_u32(mem, io_size_ptr).unwrap_or(0) as usize
+                } else {
+                    self.ui_scrap_text.len()
+                };
+                let n = requested.min(self.ui_scrap_text.len());
+                if out_data_ptr != 0 && n != 0 {
+                    let _ = mem.write(out_data_ptr, &self.ui_scrap_text[..n]);
+                }
+                if io_size_ptr != 0 {
+                    let _ = mem.write(io_size_ptr, &(n as i32).to_le_bytes());
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "PasteboardCreate" => {
+                let _name = Self::read_arg_u32(mem, cpu, 0)?;
+                let out_pb = Self::read_arg_u32(mem, cpu, 1)?;
+                if out_pb != 0 {
+                    let _ = mem.write(out_pb, &1u32.to_le_bytes());
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "PasteboardClear" => {
+                let _pb = Self::read_arg_u32(mem, cpu, 0)?;
+                self.ui_scrap_text.clear();
+                self.ui_scrap_dirty_from_guest = true;
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "PasteboardSynchronize" => {
+                let _pb = Self::read_arg_u32(mem, cpu, 0)?;
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "PasteboardPutItemFlavor" => {
+                let _pb = Self::read_arg_u32(mem, cpu, 0)?;
+                let _item_id = Self::read_arg_u32(mem, cpu, 1)?;
+                let _flavor = Self::read_arg_u32(mem, cpu, 2)?;
+                let data_ref = Self::read_arg_u32(mem, cpu, 3)?;
+                let _flags = Self::read_arg_u32(mem, cpu, 4)?;
+                if data_ref != 0 {
+                    // 简化：data_ref 按字节数组指针处理。
+                    let mut len_buf = [0u8; 4];
+                    if mem.read(data_ref, &mut len_buf).is_ok() {
+                        let guessed = u32::from_le_bytes(len_buf) as usize;
+                        if guessed > 0 && guessed < 1024 * 1024 {
+                            let data_ptr = data_ref.wrapping_add(4);
+                            let mut buf = vec![0u8; guessed];
+                            if mem.read(data_ptr, &mut buf).is_ok() {
+                                self.ui_scrap_text = buf;
+                                self.ui_scrap_dirty_from_guest = true;
+                            }
+                        }
+                    }
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "PasteboardCopyItemFlavorData" => {
+                let _pb = Self::read_arg_u32(mem, cpu, 0)?;
+                let _item_id = Self::read_arg_u32(mem, cpu, 1)?;
+                let _flavor = Self::read_arg_u32(mem, cpu, 2)?;
+                let out_data_ref_ptr = Self::read_arg_u32(mem, cpu, 3)?;
+                if out_data_ref_ptr != 0 {
+                    let sz = self.ui_scrap_text.len() as u32;
+                    let blob = self.alloc_heap(mem, sz.saturating_add(4).max(8), true)?;
+                    if blob != 0 {
+                        let _ = mem.write(blob, &sz.to_le_bytes());
+                        if sz != 0 {
+                            let _ = mem.write(blob.wrapping_add(4), &self.ui_scrap_text);
+                        }
+                        let _ = mem.write(out_data_ref_ptr, &blob.to_le_bytes());
+                    } else {
+                        let _ = mem.write(out_data_ref_ptr, &0u32.to_le_bytes());
+                    }
+                }
                 self.clear_errno(mem)?;
                 cpu.eax = 0;
                 Self::import_return(cpu, mem)?;
@@ -5667,10 +6924,9 @@ impl DyldState {
             }
             "LockPortBits" => {
                 let _port_ptr = Self::read_arg_u32(mem, cpu, 0)?;
-                let _ = self.ensure_qd_display_port(mem);
+                let _ = self.ensure_qd_display_port(mem)?;
                 self.clear_errno(mem)?;
-                // Boolean true
-                cpu.eax = 1;
+                cpu.eax = 1; // true
                 Self::import_return(cpu, mem)?;
                 Ok(())
             }
@@ -5697,14 +6953,19 @@ impl DyldState {
                         Self::qd_read_rect(mem, src_rect_ptr);
                     let (dst_top, dst_left, dst_bottom, dst_right) =
                         Self::qd_read_rect(mem, dst_rect_ptr);
+
                     let src_w = (src_right - src_left).max(0) as u32;
                     let src_h = (src_bottom - src_top).max(0) as u32;
                     let dst_w = (dst_right - dst_left).max(0) as u32;
                     let dst_h = (dst_bottom - dst_top).max(0) as u32;
+
                     let width = src_w.min(dst_w);
                     let height = src_h.min(dst_h);
-                    let bytes_per_pixel = ((self.cg_display_bits_per_pixel + 7) / 8).max(1) as usize;
+
+                    let bytes_per_pixel =
+                        ((self.cg_display_bits_per_pixel + 7) / 8).max(1) as usize;
                     let row_copy = width.saturating_mul(bytes_per_pixel as u32) as usize;
+
                     if row_copy > 0 && height > 0 {
                         let mut tmp = vec![0u8; row_copy];
                         for y in 0..height {
@@ -5712,22 +6973,26 @@ impl DyldState {
                             let dy = (dst_top.max(0) as u32).saturating_add(y);
                             let sx = src_left.max(0) as u32;
                             let dx = dst_left.max(0) as u32;
+
                             let src_addr = src_base
                                 .wrapping_add(sy.saturating_mul(src_row))
                                 .wrapping_add(sx.saturating_mul(bytes_per_pixel as u32));
                             let dst_addr = dst_base
                                 .wrapping_add(dy.saturating_mul(dst_row))
                                 .wrapping_add(dx.saturating_mul(bytes_per_pixel as u32));
+
                             if mem.read(src_addr, &mut tmp).is_ok() {
                                 let _ = mem.write(dst_addr, &tmp);
                             }
                         }
+
                         self.note_heap_candidate_write(
                             dst_base,
                             dst_row.saturating_mul(height).max(row_copy as u32),
                         );
                     }
                 }
+
                 self.clear_errno(mem)?;
                 cpu.eax = 0;
                 Self::import_return(cpu, mem)?;
@@ -6051,6 +7316,19 @@ impl DyldState {
                 let fd = Self::read_arg_u32(mem, cpu, 0)?;
                 let buf_ptr = Self::read_arg_u32(mem, cpu, 1)?;
                 let count = Self::read_arg_u32(mem, cpu, 2)?.min(16 * 1024 * 1024);
+                if fd == 0 {
+                    // 简化 stdin：默认 EOF，避免 guest 因等待输入阻塞。
+                    self.clear_errno(mem)?;
+                    cpu.eax = 0;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+                if fd <= 2 {
+                    self.set_errno(mem, ERRNO_EBADF)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
                 let mut buf = vec![0u8; count as usize];
                 let Some(file) = self.host_files.get_mut(&fd) else {
                     self.set_errno(mem, ERRNO_EBADF)?;
@@ -6067,6 +7345,189 @@ impl DyldState {
                             self.clear_errno(mem)?;
                             cpu.eax = read_n as u32;
                         }
+                    }
+                    Err(err) => {
+                        self.set_errno(mem, Self::errno_from_io(&err))?;
+                        cpu.eax = u32::MAX;
+                    }
+                }
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "write"
+            | "write$UNIX2003"
+            | "write_nocancel"
+            | "write_nocancel$UNIX2003"
+            | "_write_nocancel"
+            | "_write_nocancel$UNIX2003" => {
+                let fd = Self::read_arg_u32(mem, cpu, 0)?;
+                let buf_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+                let count = Self::read_arg_u32(mem, cpu, 2)?.min(16 * 1024 * 1024);
+                let mut buf = vec![0u8; count as usize];
+                if count != 0 && mem.read(buf_ptr, &mut buf).is_err() {
+                    self.set_errno(mem, ERRNO_EFAULT)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+
+                let written = if fd == 1 {
+                    if let Ok(text) = std::str::from_utf8(&buf) {
+                        print!("{}", text);
+                    } else {
+                        print!("{}", String::from_utf8_lossy(&buf));
+                    }
+                    buf.len()
+                } else if fd == 2 {
+                    if let Ok(text) = std::str::from_utf8(&buf) {
+                        eprint!("{}", text);
+                    } else {
+                        eprint!("{}", String::from_utf8_lossy(&buf));
+                    }
+                    buf.len()
+                } else if fd <= 2 {
+                    self.set_errno(mem, ERRNO_EBADF)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                } else if let Some(file) = self.host_files.get_mut(&fd) {
+                    match file.write(&buf) {
+                        Ok(n) => n,
+                        Err(err) => {
+                            self.set_errno(mem, Self::errno_from_io(&err))?;
+                            cpu.eax = u32::MAX;
+                            Self::import_return(cpu, mem)?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    self.set_errno(mem, ERRNO_EBADF)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                };
+
+                self.clear_errno(mem)?;
+                cpu.eax = written as u32;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "writev" | "writev$UNIX2003" => {
+                let fd = Self::read_arg_u32(mem, cpu, 0)?;
+                let iov_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+                let iovcnt = Self::read_arg_u32(mem, cpu, 2)?.min(1024);
+                if iov_ptr == 0 {
+                    self.set_errno(mem, ERRNO_EFAULT)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+
+                let mut total_written: usize = 0;
+                for i in 0..iovcnt {
+                    let base =
+                        Self::read_u32(mem, iov_ptr.wrapping_add(i.wrapping_mul(8))).unwrap_or(0);
+                    let len = Self::read_u32(
+                        mem,
+                        iov_ptr.wrapping_add(i.wrapping_mul(8)).wrapping_add(4),
+                    )
+                    .unwrap_or(0)
+                    .min(16 * 1024 * 1024);
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; len as usize];
+                    if mem.read(base, &mut buf).is_err() {
+                        self.set_errno(mem, ERRNO_EFAULT)?;
+                        cpu.eax = u32::MAX;
+                        Self::import_return(cpu, mem)?;
+                        return Ok(());
+                    }
+                    let wrote = if fd == 1 {
+                        if let Ok(text) = std::str::from_utf8(&buf) {
+                            print!("{}", text);
+                        } else {
+                            print!("{}", String::from_utf8_lossy(&buf));
+                        }
+                        buf.len()
+                    } else if fd == 2 {
+                        if let Ok(text) = std::str::from_utf8(&buf) {
+                            eprint!("{}", text);
+                        } else {
+                            eprint!("{}", String::from_utf8_lossy(&buf));
+                        }
+                        buf.len()
+                    } else if fd <= 2 {
+                        self.set_errno(mem, ERRNO_EBADF)?;
+                        cpu.eax = u32::MAX;
+                        Self::import_return(cpu, mem)?;
+                        return Ok(());
+                    } else if let Some(file) = self.host_files.get_mut(&fd) {
+                        match file.write(&buf) {
+                            Ok(n) => n,
+                            Err(err) => {
+                                self.set_errno(mem, Self::errno_from_io(&err))?;
+                                cpu.eax = u32::MAX;
+                                Self::import_return(cpu, mem)?;
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        self.set_errno(mem, ERRNO_EBADF)?;
+                        cpu.eax = u32::MAX;
+                        Self::import_return(cpu, mem)?;
+                        return Ok(());
+                    };
+                    total_written = total_written.saturating_add(wrote);
+                    if wrote < buf.len() {
+                        break;
+                    }
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = total_written as u32;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "pwrite" | "pwrite$UNIX2003" => {
+                let fd = Self::read_arg_u32(mem, cpu, 0)?;
+                let buf_ptr = Self::read_arg_u32(mem, cpu, 1)?;
+                let count = Self::read_arg_u32(mem, cpu, 2)?.min(16 * 1024 * 1024);
+                let offset = Self::read_arg_u32(mem, cpu, 3)? as u64;
+                if fd <= 2 {
+                    self.set_errno(mem, ERRNO_EBADF)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+                let mut buf = vec![0u8; count as usize];
+                if count != 0 && mem.read(buf_ptr, &mut buf).is_err() {
+                    self.set_errno(mem, ERRNO_EFAULT)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+
+                let Some(file) = self.host_files.get_mut(&fd) else {
+                    self.set_errno(mem, ERRNO_EBADF)?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                };
+                let saved_pos = file.seek(SeekFrom::Current(0));
+                if let Err(err) = file.seek(SeekFrom::Start(offset)) {
+                    self.set_errno(mem, Self::errno_from_io(&err))?;
+                    cpu.eax = u32::MAX;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+                let write_result = file.write(&buf);
+                if let Ok(pos) = saved_pos {
+                    let _ = file.seek(SeekFrom::Start(pos));
+                }
+                match write_result {
+                    Ok(n) => {
+                        self.clear_errno(mem)?;
+                        cpu.eax = n as u32;
                     }
                     Err(err) => {
                         self.set_errno(mem, Self::errno_from_io(&err))?;
@@ -6121,7 +7582,7 @@ impl DyldState {
             }
             "close" | "close$UNIX2003" => {
                 let fd = Self::read_arg_u32(mem, cpu, 0)?;
-                if self.host_files.remove(&fd).is_some() {
+                if fd <= 2 || self.host_files.remove(&fd).is_some() {
                     self.clear_errno(mem)?;
                     cpu.eax = 0;
                 } else {
@@ -6147,7 +7608,7 @@ impl DyldState {
             "fcntl" | "fcntl$UNIX2003" => {
                 let fd = Self::read_arg_u32(mem, cpu, 0)?;
                 let cmd = Self::read_arg_u32(mem, cpu, 1)?;
-                if !self.host_files.contains_key(&fd) {
+                if fd > 2 && !self.host_files.contains_key(&fd) {
                     self.set_errno(mem, ERRNO_EBADF)?;
                     cpu.eax = u32::MAX;
                     Self::import_return(cpu, mem)?;
@@ -6394,9 +7855,17 @@ impl DyldState {
                 Self::import_return(cpu, mem)?;
                 Ok(())
             }
-            "tolower" => {
+            "tolower" | "tolower$UNIX2003" | "_tolower" | "_tolower$UNIX2003" | "__tolower"
+            | "__tolower$UNIX2003" => {
                 let ch = (Self::read_arg_u32(mem, cpu, 0)? & 0xff) as u8;
                 cpu.eax = ch.to_ascii_lowercase() as u32;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "toupper" | "toupper$UNIX2003" | "_toupper" | "_toupper$UNIX2003" | "__toupper"
+            | "__toupper$UNIX2003" => {
+                let ch = (Self::read_arg_u32(mem, cpu, 0)? & 0xff) as u8;
+                cpu.eax = ch.to_ascii_uppercase() as u32;
                 Self::import_return(cpu, mem)?;
                 Ok(())
             }
@@ -6463,6 +7932,38 @@ impl DyldState {
                 mem.read(src, &mut tmp)?;
                 mem.write(dst, &tmp)?;
                 cpu.eax = dst;
+                Self::import_return(cpu, mem)?;
+                Ok(())
+            }
+            "strdup" => {
+                let src = Self::read_arg_u32(mem, cpu, 0)?;
+                if src == 0 {
+                    self.set_errno(mem, ERRNO_EFAULT)?;
+                    cpu.eax = 0;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+                let len = match Self::c_strlen(mem, src, 1 << 20) {
+                    Ok(v) => v as u32,
+                    Err(_) => {
+                        self.set_errno(mem, ERRNO_EFAULT)?;
+                        cpu.eax = 0;
+                        Self::import_return(cpu, mem)?;
+                        return Ok(());
+                    }
+                };
+                let out = self.alloc_heap(mem, len.saturating_add(1), false)?;
+                if out == 0 {
+                    self.set_errno(mem, ERRNO_ENOMEM)?;
+                    cpu.eax = 0;
+                    Self::import_return(cpu, mem)?;
+                    return Ok(());
+                }
+                let mut tmp = vec![0u8; (len + 1) as usize];
+                mem.read(src, &mut tmp)?;
+                mem.write(out, &tmp)?;
+                self.clear_errno(mem)?;
+                cpu.eax = out;
                 Self::import_return(cpu, mem)?;
                 Ok(())
             }
@@ -6684,6 +8185,25 @@ impl DyldState {
                 self.mark_thread_exited(tid, status);
                 Err(DyldError::GuestThreadExit { tid, status })
             }
+            "_m32run_pthread_once_continue" | "m32run_pthread_once_continue" => {
+                // pthread_once 的初始化回调返回后会进入这个 trampoline，
+                // 然后回到原始 pthread_once 调用点。
+                let tid = self.current_thread_tid.max(1);
+                let ret_addr = self
+                    .pthread_once_pending_ret_by_tid
+                    .get_mut(&tid)
+                    .and_then(|stack| stack.pop())
+                    .ok_or(DyldError::InvalidGuestStack)?;
+                if let Some(stack) = self.pthread_once_pending_ret_by_tid.get(&tid) {
+                    if stack.is_empty() {
+                        self.pthread_once_pending_ret_by_tid.remove(&tid);
+                    }
+                }
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                cpu.eip = ret_addr;
+                Ok(())
+            }
             "abort" => Err(DyldError::GuestExit(134)),
             "exit" | "_exit" => {
                 let status = Self::read_arg_u32(mem, cpu, 0)?;
@@ -6691,6 +8211,47 @@ impl DyldState {
                     eprintln!("[DYLD] import exit({}) called, forcing guest halt", status);
                 }
                 Err(DyldError::GuestExit(status))
+            }
+            "pow" => {
+                let x = Self::read_arg_f64(mem, cpu, 0)?;
+                let y = Self::read_arg_f64(mem, cpu, 2)?;
+                let out = x.powf(y);
+                self.clear_errno(mem)?;
+                Self::return_f64(cpu, out);
+                Self::import_return(cpu, mem)?;
+                return Ok(());
+            }
+            "floor" => {
+                let x = Self::read_arg_f64(mem, cpu, 0)?;
+                let out = x.floor();
+                self.clear_errno(mem)?;
+                Self::return_f64(cpu, out);
+                Self::import_return(cpu, mem)?;
+                return Ok(());
+            }
+            "sin" => {
+                let x = Self::read_arg_f64(mem, cpu, 0)?;
+                let out = x.sin();
+                self.clear_errno(mem)?;
+                Self::return_f64(cpu, out);
+                Self::import_return(cpu, mem)?;
+                return Ok(());
+            }
+            "log" => {
+                let x = Self::read_arg_f64(mem, cpu, 0)?;
+                let out = x.ln();
+                self.clear_errno(mem)?;
+                Self::return_f64(cpu, out);
+                Self::import_return(cpu, mem)?;
+                return Ok(());
+            }
+            "FindNextComponent" | "_FindNextComponent" => {
+                // 先保持最小兼容：告诉 guest 没有可用 component。
+                // 这会让部分旧程序禁用 CoreAudio，但不会阻塞启动。
+                self.clear_errno(mem)?;
+                cpu.eax = 0;
+                Self::import_return(cpu, mem)?;
+                return Ok(());
             }
             _ => self.noop_import(cpu, mem, &binding),
         }
@@ -6767,45 +8328,8 @@ pub fn load<P: AsRef<Path>>(
     let mut file = File::open(path_ref)?;
     let mut dyld = DyldState::from_macho(&macho, trace);
     dyld.set_main_executable_path(path_ref);
-    let main_max_vmend = macho
-        .segments
-        .iter()
-        .filter(|s| s.segname != "__PAGEZERO")
-        .map(|s| s.vmaddr.wrapping_add(s.vmsize))
-        .max()
-        .unwrap_or(0);
-
     // 新建 guest 内存空间
     let mut mem = GuestMemory::new();
-    // 兼容兜底：允许读取/写入 NULL page，减少老二进制在半实现运行时下的
-    // “address 0x0/0x4 not mapped” 直接中断。
-    // 真实系统里 __PAGEZERO 通常不可访问；这里是兼容优先策略。
-    if mem
-        .map(0x0000_0000, 0x1000, Prot::READ | Prot::WRITE)
-        .is_err()
-        && trace
-    {
-        eprintln!("[LOADER] warning: failed to map null compatibility page");
-    }
-    // 兼容兜底：部分老 libstdc++ 路径会对空指针做 `-0xc` 形式访问。
-    // 这里映射高地址末页的一小段零页，避免直接因 `0xfffffff4` 触发崩溃。
-    // 注意不能映射完整 0x1000（会溢出到 0x1_0000_0000）。
-    if mem
-        .map(0xffff_f000, 0x0ffc, Prot::READ | Prot::WRITE)
-        .is_err()
-        && trace
-    {
-        eprintln!("[LOADER] warning: failed to map compat high page");
-    }
-    // 兼容兜底：部分旧二进制在缺少完整运行时语义时会把指针错误扩展到 0x80xx_xxxx。
-    // 这里预留一段中高地址“缓冲区”减少直接崩溃（优先让程序继续跑，便于补语义）。
-    if mem
-        .map(0x8000_0000, 0x0200_0000, Prot::READ | Prot::WRITE)
-        .is_err()
-        && trace
-    {
-        eprintln!("[LOADER] warning: failed to map compat mid-high region");
-    }
 
     // ------------------------------------------------------------
     // 2. 把 Mach-O 各段映射到 guest 内存
@@ -6854,27 +8378,10 @@ pub fn load<P: AsRef<Path>>(
 
             mem.write(seg.vmaddr, &buf)?;
         }
+        mem.protect(seg.vmaddr, seg.vmsize, runtime_prot)?;
 
         // 如果 vmsize > filesize，后面的 zero-fill 区域（例如 bss）
         // 会自然保持为 0，因为 map() 默认分配的是零初始化缓冲区。
-    }
-
-    // 兼容兜底：给主镜像尾部补一段松弛地址空间，承接部分老 PIC/异常路径的
-    // 越界全局指针访问，避免直接因“稍高地址未映射”中断。
-    let tail_base = DyldState::align_up(main_max_vmend, 0x1000);
-    if tail_base != 0 {
-        let tail_size = 0x0040_0000; // 4 MiB
-        if mem
-            .map(tail_base, tail_size, Prot::READ | Prot::WRITE)
-            .is_ok()
-        {
-            if trace {
-                eprintln!(
-                    "[LOADER] mapped compatibility tail region at {:#010x} (size={:#x})",
-                    tail_base, tail_size
-                );
-            }
-        }
     }
 
     dyld.init_runtime_memory(&mut mem)?;

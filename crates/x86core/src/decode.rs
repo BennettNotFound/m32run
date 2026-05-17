@@ -38,7 +38,7 @@ impl<'a> InstructionStream<'a> {
 
     pub fn fetch_u8(&mut self) -> Result<u8, ExecError> {
         let mut buf = [0u8; 1];
-        self.mem.read(self.ip, &mut buf)?;
+        self.mem.read_exec(self.ip, &mut buf)?;
         self.ip = self.ip.wrapping_add(1);
         Ok(buf[0])
     }
@@ -49,14 +49,14 @@ impl<'a> InstructionStream<'a> {
 
     pub fn fetch_u16(&mut self) -> Result<u16, ExecError> {
         let mut buf = [0u8; 2];
-        self.mem.read(self.ip, &mut buf)?;
+        self.mem.read_exec(self.ip, &mut buf)?;
         self.ip = self.ip.wrapping_add(2);
         Ok(u16::from_le_bytes(buf))
     }
 
     pub fn fetch_u32(&mut self) -> Result<u32, ExecError> {
         let mut buf = [0u8; 4];
-        self.mem.read(self.ip, &mut buf)?;
+        self.mem.read_exec(self.ip, &mut buf)?;
         self.ip = self.ip.wrapping_add(4);
         Ok(u32::from_le_bytes(buf))
     }

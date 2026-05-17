@@ -8,3 +8,4 @@ edition = "2021"
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.25"
 objc = "0.2"
+sdl2 = { version = "0.38", features = ["use-pkgconfig"] }

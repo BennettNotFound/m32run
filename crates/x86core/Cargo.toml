@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 guestmem = { path = "../guestmem" }
 thiserror = "1"
+runtime_log = { path = "../runtime_log" }

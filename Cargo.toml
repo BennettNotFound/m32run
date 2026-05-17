@@ -9,6 +9,7 @@
 ##
 [workspace]
 members = [
+    "crates/runtime_log",
     "crates/macho32",
     "crates/guestmem",
     "crates/x86core",

@@ -13,7 +13,7 @@ pub enum ExecError {
     UnimplementedOpcode(u8, u32),
 
     #[error("invalid instruction at {0:#010x}: {1}")]
-    InvalidInstruction(u32, &'static str),
+    InvalidInstruction(u32, String),
 
     #[error("execution halted")]
     Halt,
@@ -61,7 +61,10 @@ impl Cpu {
                 }
                 // 地址大小前缀：当前解释器仅实现 32 位地址模式，先忽略
                 0x67 => {
-                    opcode = s.fetch_u8()?;
+                    return Err(ExecError::InvalidInstruction(
+                        start,
+                        "address-size override prefix 0x67 not implemented".into(),
+                    ));
                 }
                 // F2, F3 是 REP 前缀，有时也用于对齐或分支预测提示
                 0xF2 => {
@@ -737,7 +740,7 @@ impl Cpu {
                 if modrm.mod_ == 0b11 {
                     return Err(ExecError::InvalidInstruction(
                         start,
-                        "lea requires memory operand",
+                        "lea requires memory operand".into(),
                     ));
                 }
                 let addr = self.calc_effective_addr(mem, &mut s, modrm)?;
@@ -1339,7 +1342,7 @@ impl Cpu {
             }
 
             0x80 | 0x82 => {
-                // Group 1: 8位 ALU 运算 (ADD, OR, AND, SUB, XOR, CMP)
+                // Group 1: 8位 ALU 运算 (ADD, OR, ADC, SBB, AND, SUB, XOR, CMP)
                 let modrm = s.fetch_modrm()?;
                 let dst = self.decode_rm32_operand(mem, &mut s, modrm)?;
                 let imm = s.fetch_u8()?;
@@ -1363,6 +1366,8 @@ impl Cpu {
                 let res32 = match modrm.reg {
                     0 => self.alu_add32(lhs as u32, imm as u32),
                     1 => self.alu_or32(lhs as u32, imm as u32),
+                    2 => self.alu_adc32(lhs as u32, imm as u32),
+                    3 => self.alu_sbb32(lhs as u32, imm as u32),
                     4 => self.alu_and32(lhs as u32, imm as u32),
                     5 => self.alu_sub32(lhs as u32, imm as u32),
                     6 => self.alu_xor32(lhs as u32, imm as u32),
@@ -1486,6 +1491,8 @@ impl Cpu {
                 let result = match modrm.reg {
                     0 => self.alu_add32(lhs, imm),
                     1 => self.alu_or32(lhs, imm),
+                    2 => self.alu_adc32(lhs, imm),
+                    3 => self.alu_sbb32(lhs, imm),
                     4 => self.alu_and32(lhs, imm),
                     5 => self.alu_sub32(lhs, imm),
                     6 => self.alu_xor32(lhs, imm),
@@ -1612,7 +1619,10 @@ impl Cpu {
                     6 => {
                         // DIV r/m8: AX / r/m8 => AL=quot, AH=rem
                         if val == 0 {
-                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                            return Err(ExecError::InvalidInstruction(
+                                start,
+                                "division by zero".into(),
+                            ));
                         }
                         let dividend = ((self.reg8(4) as u16) << 8) | (self.reg8(0) as u16);
                         let quot = dividend / (val as u16);
@@ -1623,13 +1633,19 @@ impl Cpu {
                     7 => {
                         // IDIV r/m8: AX / r/m8 => AL=quot, AH=rem (signed)
                         if val == 0 {
-                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                            return Err(ExecError::InvalidInstruction(
+                                start,
+                                "division by zero".into(),
+                            ));
                         }
                         let dividend =
                             (((self.reg8(4) as u16) << 8) | (self.reg8(0) as u16)) as i16;
                         let divisor = val as i8 as i16;
                         if dividend == i16::MIN && divisor == -1 {
-                            return Err(ExecError::InvalidInstruction(start, "division overflow"));
+                            return Err(ExecError::InvalidInstruction(
+                                start,
+                                "division overflow".into(),
+                            ));
                         }
                         let quot = dividend / divisor;
                         let rem = dividend % divisor;
@@ -1690,7 +1706,10 @@ impl Cpu {
                     6 => {
                         // DIV r/m32 (无符号除法，EDX:EAX / r/m32)
                         if val == 0 {
-                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                            return Err(ExecError::InvalidInstruction(
+                                start,
+                                "division by zero".into(),
+                            ));
                         }
                         let dividend = ((self.edx as u64) << 32) | (self.eax as u64);
                         let quot = dividend / (val as u64);
@@ -1701,7 +1720,10 @@ impl Cpu {
                     7 => {
                         // IDIV r/m32 (有符号除法)
                         if val == 0 {
-                            return Err(ExecError::InvalidInstruction(start, "division by zero"));
+                            return Err(ExecError::InvalidInstruction(
+                                start,
+                                "division by zero".into(),
+                            ));
                         }
                         let dividend = ((self.edx as u64) << 32) | (self.eax as u64);
                         let dividend_signed = dividend as i64;
@@ -1709,7 +1731,10 @@ impl Cpu {
 
                         // 防止 INT_MIN / -1 导致的溢出崩溃
                         if dividend_signed == -9223372036854775808 && divisor_signed == -1 {
-                            return Err(ExecError::InvalidInstruction(start, "division overflow"));
+                            return Err(ExecError::InvalidInstruction(
+                                start,
+                                "division overflow".into(),
+                            ));
                         }
 
                         let quot = dividend_signed / divisor_signed;
@@ -1819,14 +1844,13 @@ impl Cpu {
                         // 运行时 heap 区本质是数据区；跳进去执行通常意味着函数指针坏掉。
                         let heap_like_target = (0x6500_0000..0x6f00_0000).contains(&target);
                         if target == 0 || self_ref_slot || data_like_target || heap_like_target {
-                            if self.trace {
-                                eprintln!(
-                                    "[EXEC] skipped invalid indirect call at {:#010x}: slot={:#010x?} target={:#010x}",
+                            return Err(ExecError::InvalidInstruction(
+                                self.eip,
+                                format!(
+                                    "invalid indirect call target at {:#010x}: slot={:#010x?} target={:#010x}",
                                     start, slot_addr, target
-                                );
-                            }
-                            self.eip = return_eip;
-                            return Ok(());
+                                ),
+                            ));
                         }
                         self.push32(mem, return_eip)?;
                         self.eip = if is_16bit { target & 0xFFFF } else { target };
@@ -3476,7 +3500,10 @@ impl Cpu {
             0xCE => {
                 // INTO: only triggers when OF=1; otherwise behaves like NOP.
                 if Flags::get(self.eflags, Flags::OF) {
-                    return Err(ExecError::InvalidInstruction(start, "into overflow trap"));
+                    return Err(ExecError::InvalidInstruction(
+                        start,
+                        "into overflow trap".into(),
+                    ));
                 }
                 self.eip = s.ip;
                 return Ok(());

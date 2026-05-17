@@ -9,5 +9,6 @@ x86core = { path = "../x86core" }
 shim = { path = "../shim" } # 新增这一行
 host = { path = "../host" }
 thiserror = "1"
-minifb = "0.27"
 plist = "1"
+runtime_log = { path = "../runtime_log" }
+ctrlc = "3"
